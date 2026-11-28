@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import os
@@ -8,7 +9,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 import discord
 from discord import app_commands
@@ -27,8 +28,8 @@ load_dotenv()
 # =====================================================================
 
 DEFAULT_CONFIG = {
-    "odds_1day": 500,                  # 1 in 500 chance per message
-    "odds_lifetime": 3000,             # 1 in 3,000 chance per message
+    "odds_1day": 500,                  # 1 in 500 chance per roll
+    "odds_lifetime": 3000,             # 1 in 3,000 chance per roll
     "max_stock_1day": 30,              # 30 keys stock cap for 1-Day
     "max_stock_lifetime": 15,          # 15 keys stock cap for Lifetime
     "roll_cooldown_seconds": 0,        # 0s = disabled (uses Discord channel slowmode)
@@ -37,6 +38,15 @@ DEFAULT_CONFIG = {
     "oneday_user_cooldown_hours": 24,  # 24h before same user can win another 1-Day key
     "show_remaining_stock_publicly": True,
     "log_channel_id": None,
+    # Voice Channel (VC) Drop Settings
+    "vc_enabled": True,                # Roll for keys while hanging out in VC
+    "vc_odds_1day": 250,               # 1 in 250 per minute in VC
+    "vc_odds_lifetime": 500,           # 1 in 500 per minute in VC
+    "vc_interval_seconds": 60,         # 1 roll every 60 seconds in VC
+    "vc_min_members": 2,               # At least 2 real people in same VC
+    "vc_ignore_deafened": False,       # Muted/deafened allowed when >= 2 real people are in VC
+    "vc_ignore_muted": False,          # User can be muted in VC
+    "vc_announce_channel_id": None,    # Optional text channel (e.g. #general) for VC drop alerts
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,7 +95,7 @@ class PirateDatabase:
         self._conn = sqlite3.connect(
             self.db_path,
             timeout=10.0,
-            isolation_level=None,  # Autocommit unless explicit transaction
+            isolation_level=None,
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
@@ -123,6 +133,7 @@ class PirateDatabase:
                 user_id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL,
                 total_rolls INTEGER NOT NULL DEFAULT 0,
+                vc_rolls INTEGER NOT NULL DEFAULT 0,
                 last_roll_at REAL NOT NULL DEFAULT 0,
                 oneday_wins INTEGER NOT NULL DEFAULT 0,
                 lifetime_wins INTEGER NOT NULL DEFAULT 0,
@@ -135,6 +146,10 @@ class PirateDatabase:
             );
             """
         )
+        # Seamless migration for existing databases created before VC drops were added
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "vc_rolls" not in cols:
+            self._conn.execute("ALTER TABLE users ADD COLUMN vc_rolls INTEGER NOT NULL DEFAULT 0;")
 
     def _seed_default_settings(self) -> None:
         merged = dict(DEFAULT_CONFIG)
@@ -161,6 +176,14 @@ class PirateDatabase:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+        if not self.get_setting("vc_v2_migrated", False):
+            self.set_setting("vc_odds_1day", 250)
+            self.set_setting("vc_odds_lifetime", 500)
+            self.set_setting("vc_min_members", 2)
+            self.set_setting("vc_ignore_muted", False)
+            self.set_setting("vc_ignore_deafened", False)
+            self.set_setting("vc_v2_migrated", True)
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -358,8 +381,8 @@ class PirateDatabase:
             if row is None:
                 self._conn.execute(
                     """
-                    INSERT INTO users (user_id, username, total_rolls, last_roll_at)
-                    VALUES (?, ?, 1, ?)
+                    INSERT INTO users (user_id, username, total_rolls, vc_rolls, last_roll_at)
+                    VALUES (?, ?, 1, 0, ?)
                     """,
                     (user_id, username, now),
                 )
@@ -382,6 +405,35 @@ class PirateDatabase:
             updated = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
             self._conn.execute("COMMIT")
             return True, dict(updated)
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def record_vc_roll(self, user_id: int, username: str) -> dict[str, Any]:
+        """Records a Voice Channel roll without interfering with message cooldown."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            if row is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO users (user_id, username, total_rolls, vc_rolls, last_roll_at)
+                    VALUES (?, ?, 1, 1, 0)
+                    """,
+                    (user_id, username),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, total_rolls = total_rolls + 1, vc_rolls = vc_rolls + 1
+                    WHERE user_id = ?
+                    """,
+                    (username, user_id),
+                )
+            updated = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            self._conn.execute("COMMIT")
+            return dict(updated)
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
@@ -517,6 +569,7 @@ class PirateDatabase:
             return {
                 "user_id": user_id,
                 "total_rolls": 0,
+                "vc_rolls": 0,
                 "oneday_wins": 0,
                 "lifetime_wins": 0,
             }
@@ -579,8 +632,9 @@ def format_tier_name(tier: str) -> str:
     return "🗝️ 1-Day Script Key"
 
 
-def build_private_key_embed(tier: str, key_text: str) -> discord.Embed:
+def build_private_key_embed(tier: str, key_text: str, source: str = "chat") -> discord.Embed:
     is_lifetime = tier == "lifetime"
+    via_txt = "hanging out in Voice Chat" if source == "vc" else "chatting"
     title = (
         "🏴‍☠️ PIRATE TOKEN UNLOCKED — LIFETIME KEY!"
         if is_lifetime
@@ -588,13 +642,13 @@ def build_private_key_embed(tier: str, key_text: str) -> discord.Embed:
     )
     color = discord.Color.gold() if is_lifetime else discord.Color.teal()
     desc = (
-        "Congratulations! You hit the ultra-rare **Lifetime Pirate Token** drop just by chatting!\n\n"
+        f"Congratulations! You hit the ultra-rare **Lifetime Pirate Token** drop just by {via_txt}!\n\n"
         if is_lifetime
-        else "Nice! You pulled a **1-Day Script Key** drop from chatting!\n\n"
+        else f"Nice! You pulled a **1-Day Script Key** drop from {via_txt}!\n\n"
     )
     desc += f"**Your Key / Reward:**\n```\n{key_text}\n```\n*Keep this private — do not share it in public chat!*"
 
-    embed = discord.Embed(title=title, description=desc, color=color)
+    embed = discord.Embed(title=title, description=desc[:4090], color=color)
     embed.set_footer(text="Pirate Token Drop System • Use /mykeys anytime to view your won keys")
     return embed
 
@@ -635,7 +689,7 @@ class ClaimKeyButton(
         winner_id = int(record["claimed_by_id"])
         if interaction.user.id != winner_id:
             await interaction.followup.send(
-                f"🏴‍☠️ Hands off, matey! This treasure belongs to <@{winner_id}> — keep chatting to find your own!",
+                f"🏴‍☠️ Hands off, matey! This treasure belongs to <@{winner_id}> — keep chatting or hanging in VC to find your own!",
                 ephemeral=True,
             )
             return
@@ -652,7 +706,7 @@ class AddKeysModal(discord.ui.Modal):
         style=discord.TextStyle.paragraph,
         placeholder="KEY-XXXX-YYYY-1\nKEY-XXXX-YYYY-2\nKEY-XXXX-YYYY-3",
         required=True,
-        max_length=4000,
+        max_length=3500,
     )
 
     def __init__(self, tier: Literal["1day", "lifetime"], ignore_cap: bool = False) -> None:
@@ -685,9 +739,11 @@ class PirateBot(discord.Client):
         intents.guilds = True
         intents.messages = True
         intents.message_content = True
+        intents.voice_states = True  # Non-privileged: tracks live VC members!
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self._synced_guilds: set[int] = set()
+        self._member_cache: dict[tuple[int, int], discord.Member] = {}
+        self._vc_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
         imported_1d = db.import_seed_file("1day", SEED_1DAY_PATH)
@@ -701,26 +757,162 @@ class PirateBot(discord.Client):
         self.add_dynamic_items(ClaimKeyButton)
         await self.tree.sync()
         print("[SYNC] Synced global slash commands.")
+        self._vc_task = asyncio.create_task(self._vc_drop_loop())
 
     async def on_ready(self) -> None:
         stock = db.get_stock_counts()
         odds_1d = db.get_setting("odds_1day", 500)
         odds_lt = db.get_setting("odds_lifetime", 3000)
         cooldown = db.get_setting("roll_cooldown_seconds", 0)
+        vc_on = db.get_setting("vc_enabled", True)
+        vc_int = db.get_setting("vc_interval_seconds", 60)
+        vc_1d = db.get_setting("vc_odds_1day", 250)
+        vc_lt = db.get_setting("vc_odds_lifetime", 500)
         print("=" * 58)
         print(f"🏴‍☠️ Pirate Token Bot is ONLINE as {self.user} (ID: {self.user.id})")
         print(f"   • Guilds Connected  : {[g.name for g in self.guilds]}")
-        print(f"   • 1-Day Key Odds    : 1 in {odds_1d} | Stock: {stock['1day']['available']}/{stock['1day']['cap']}")
-        print(f"   • Lifetime Key Odds : 1 in {odds_lt} | Stock: {stock['lifetime']['available']}/{stock['lifetime']['cap']}")
-        print(f"   • Roll Cooldown     : {cooldown}s")
+        print(f"   • 1-Day Key Odds    : Chat 1/{odds_1d} | VC 1/{vc_1d} | Stock: {stock['1day']['available']}/{stock['1day']['cap']}")
+        print(f"   • Lifetime Key Odds : Chat 1/{odds_lt} | VC 1/{vc_lt} | Stock: {stock['lifetime']['available']}/{stock['lifetime']['cap']}")
+        print(f"   • Chat Cooldown     : {cooldown}s")
+        print(f"   • VC Drops          : {'ON' if vc_on else 'OFF'} (every {vc_int}s)")
         print(f"   • SQLite DB Path    : {DB_PATH}")
         print("=" * 58)
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="chat for Pirate Token drops 🏴‍☠️",
+                name="chat & VC for Pirate Token drops 🏴‍☠️",
             )
         )
+
+    async def _resolve_member(self, guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+        member = guild.get_member(user_id)
+        if member is not None:
+            self._member_cache[(guild.id, user_id)] = member
+            return member
+        cached = self._member_cache.get((guild.id, user_id))
+        if cached is not None:
+            return cached
+        try:
+            fetched = await guild.fetch_member(user_id)
+            self._member_cache[(guild.id, user_id)] = fetched
+            return fetched
+        except discord.HTTPException:
+            return None
+
+    async def _roll_for_user(
+        self,
+        user: Union[discord.Member, discord.User],
+        user_row: dict[str, Any],
+        guild: discord.Guild,
+        source_channel: Union[discord.abc.GuildChannel, discord.Thread],
+        trigger_message: Optional[discord.Message] = None,
+        source: Literal["chat", "vc"] = "chat",
+    ) -> None:
+        multiplier, _ = db.get_active_multiplier()
+        lt_setting_key = "vc_odds_lifetime" if source == "vc" else "odds_lifetime"
+        lt_default = 500 if source == "vc" else 3000
+        oneday_setting_key = "vc_odds_1day" if source == "vc" else "odds_1day"
+        oneday_default = 250 if source == "vc" else 500
+
+        # 1) Roll for LIFETIME Pirate Token first (Jackpot)
+        if db.can_user_win(user_row, "lifetime") and db.has_available_key_for_user("lifetime", user.id):
+            base_lt_odds = max(1, int(db.get_setting(lt_setting_key, lt_default)))
+            effective_lt_odds = max(1, round(base_lt_odds / multiplier))
+            if secrets.randbelow(effective_lt_odds) == 0:
+                claimed = db.claim_key_atomic(
+                    tier="lifetime",
+                    user_id=user.id,
+                    username=str(user),
+                    channel_id=source_channel.id,
+                )
+                if claimed:
+                    await self._deliver_drop(
+                        guild=guild,
+                        winner=user,
+                        source_channel=source_channel,
+                        claimed=claimed,
+                        odds_hit=effective_lt_odds,
+                        user_rolls=int(user_row["total_rolls"]),
+                        trigger_message=trigger_message,
+                        source=source,
+                    )
+                    return
+
+        # 2) Roll for 1-DAY Script Key second
+        if db.can_user_win(user_row, "1day") and db.has_available_key_for_user("1day", user.id):
+            base_1d_odds = max(1, int(db.get_setting(oneday_setting_key, oneday_default)))
+            effective_1d_odds = max(1, round(base_1d_odds / multiplier))
+            if secrets.randbelow(effective_1d_odds) == 0:
+                claimed = db.claim_key_atomic(
+                    tier="1day",
+                    user_id=user.id,
+                    username=str(user),
+                    channel_id=source_channel.id,
+                )
+                if claimed:
+                    await self._deliver_drop(
+                        guild=guild,
+                        winner=user,
+                        source_channel=source_channel,
+                        claimed=claimed,
+                        odds_hit=effective_1d_odds,
+                        user_rolls=int(user_row["total_rolls"]),
+                        trigger_message=trigger_message,
+                        source=source,
+                    )
+                    return
+
+    async def _vc_drop_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            interval = max(15, int(db.get_setting("vc_interval_seconds", 60)))
+            await asyncio.sleep(interval)
+
+            if not bool(db.get_setting("vc_enabled", True)):
+                continue
+
+            min_members = max(1, int(db.get_setting("vc_min_members", 2)))
+            ignore_deaf = bool(db.get_setting("vc_ignore_deafened", False))
+            ignore_mute = bool(db.get_setting("vc_ignore_muted", False))
+
+            try:
+                for guild in list(self.guilds):
+                    voice_channels = list(guild.voice_channels) + list(guild.stage_channels)
+                    for vc in voice_channels:
+                        if guild.afk_channel and vc.id == guild.afk_channel.id:
+                            continue
+                        if db.is_channel_ignored(vc.id):
+                            continue
+                        if not vc.voice_states:
+                            continue
+
+                        humans_in_vc: list[tuple[discord.Member, discord.VoiceState]] = []
+                        for uid, vstate in list(vc.voice_states.items()):
+                            member = await self._resolve_member(guild, uid)
+                            if member is None or member.bot:
+                                continue
+                            humans_in_vc.append((member, vstate))
+
+                        if len(humans_in_vc) < min_members:
+                            continue
+
+                        for member, vstate in humans_in_vc:
+                            if ignore_deaf and (vstate.self_deaf or vstate.deaf):
+                                continue
+                            if ignore_mute and (vstate.self_mute or vstate.mute):
+                                continue
+
+                            user_row = db.record_vc_roll(member.id, str(member))
+                            await self._roll_for_user(
+                                user=member,
+                                user_row=user_row,
+                                guild=guild,
+                                source_channel=vc,
+                                trigger_message=None,
+                                source="vc",
+                            )
+            except Exception as exc:
+                print(f"[WARN] Error in VC drop loop: {exc}")
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None or message.webhook_id is not None:
@@ -738,77 +930,60 @@ class PirateBot(discord.Client):
         if not ready:
             return
 
-        multiplier, _ = db.get_active_multiplier()
-
-        # 1) Roll for LIFETIME Pirate Token first (Jackpot)
-        if db.can_user_win(user_row, "lifetime") and db.has_available_key_for_user(
-            "lifetime", message.author.id
-        ):
-            base_lt_odds = max(1, int(db.get_setting("odds_lifetime", 3000)))
-            effective_lt_odds = max(1, round(base_lt_odds / multiplier))
-            if secrets.randbelow(effective_lt_odds) == 0:
-                claimed = db.claim_key_atomic(
-                    tier="lifetime",
-                    user_id=message.author.id,
-                    username=str(message.author),
-                    channel_id=message.channel.id,
-                )
-                if claimed:
-                    await self._deliver_drop(message, claimed, effective_lt_odds, user_row["total_rolls"])
-                    return
-
-        # 2) Roll for 1-DAY Script Key second
-        if db.can_user_win(user_row, "1day") and db.has_available_key_for_user(
-            "1day", message.author.id
-        ):
-            base_1d_odds = max(1, int(db.get_setting("odds_1day", 500)))
-            effective_1d_odds = max(1, round(base_1d_odds / multiplier))
-            if secrets.randbelow(effective_1d_odds) == 0:
-                claimed = db.claim_key_atomic(
-                    tier="1day",
-                    user_id=message.author.id,
-                    username=str(message.author),
-                    channel_id=message.channel.id,
-                )
-                if claimed:
-                    await self._deliver_drop(message, claimed, effective_1d_odds, user_row["total_rolls"])
-                    return
+        await self._roll_for_user(
+            user=message.author,
+            user_row=user_row,
+            guild=message.guild,
+            source_channel=message.channel,
+            trigger_message=message,
+            source="chat",
+        )
 
     async def _deliver_drop(
         self,
-        trigger_message: discord.Message,
+        guild: discord.Guild,
+        winner: Union[discord.Member, discord.User],
+        source_channel: Union[discord.abc.GuildChannel, discord.Thread],
         claimed: dict,
         odds_hit: int,
         user_rolls: int,
+        trigger_message: Optional[discord.Message] = None,
+        source: Literal["chat", "vc"] = "chat",
     ) -> None:
-        winner = trigger_message.author
         tier = claimed["tier"]
         key_id = int(claimed["id"])
         key_text = claimed["key_text"]
         remaining = int(claimed["remaining"])
         is_lifetime = tier == "lifetime"
+        is_vc = source == "vc"
 
         dm_sent = False
         try:
-            dm_embed = build_private_key_embed(tier, key_text)
+            dm_embed = build_private_key_embed(tier, key_text, source=source)
             await winner.send(embed=dm_embed)
             dm_sent = True
         except (discord.Forbidden, discord.HTTPException):
             dm_sent = False
+
+        activity_phrase = (
+            f"while hanging out in <#{source_channel.id}> 🔊"
+            if is_vc
+            else f"on roll **#{user_rolls:,}**"
+        )
 
         if is_lifetime:
             pub_title = "🏴‍☠️ MYTHIC DROP! PIRATE TOKEN FOUND! 🏴‍☠️"
             pub_color = discord.Color.gold()
             pub_desc = (
                 f"🎉 {winner.mention} just pulled a **LIFETIME SCRIPT KEY (Pirate Token)** "
-                f"at **`1 in {odds_hit:,}`** odds on message **#{user_rolls:,}**!"
+                f"{activity_phrase} at **`1 in {odds_hit:,}`** odds!"
             )
         else:
             pub_title = "🗝️ TREASURE DROP! 1-DAY KEY FOUND!"
             pub_color = discord.Color.teal()
             pub_desc = (
                 f"✨ {winner.mention} just unlocked a **1-Day Script Key** "
-                f"at **`1 in {odds_hit:,}`** odds on message **#{user_rolls:,}**!"
+                f"{activity_phrase} at **`1 in {odds_hit:,}`** odds!"
             )
 
         if dm_sent:
@@ -823,45 +998,71 @@ class PirateBot(discord.Client):
 
         pub_embed = discord.Embed(title=pub_title, description=pub_desc, color=pub_color)
         pub_embed.set_thumbnail(url=winner.display_avatar.url)
-        pub_embed.set_footer(text="Keep chatting anywhere for a chance to unlock keys!")
+        pub_embed.set_footer(text="Chat or hang out in Voice Channels for a chance to unlock keys!")
 
         view = discord.ui.View(timeout=None)
         view.add_item(ClaimKeyButton(key_id))
 
         sent_msg: Optional[discord.Message] = None
-        try:
-            sent_msg = await trigger_message.reply(
-                content=winner.mention,
-                embed=pub_embed,
-                view=view,
-                mention_author=True,
-            )
-        except discord.HTTPException:
+        if trigger_message is not None:
             try:
-                sent_msg = await trigger_message.channel.send(
+                sent_msg = await trigger_message.reply(
                     content=winner.mention,
                     embed=pub_embed,
                     view=view,
+                    mention_author=True,
                 )
-            except discord.HTTPException as exc:
-                print(f"[WARN] Could not send public drop embed: {exc}")
+            except discord.HTTPException:
+                try:
+                    sent_msg = await trigger_message.channel.send(
+                        content=winner.mention,
+                        embed=pub_embed,
+                        view=view,
+                    )
+                except discord.HTTPException as exc:
+                    print(f"[WARN] Could not send public chat drop embed: {exc}")
+        else:
+            # Voice Channel drop: send to configured VC announce channel, or VC's built-in text chat, or system channel
+            targets: list[discord.abc.Messageable] = []
+            vc_ann_id = db.get_setting("vc_announce_channel_id", None)
+            if vc_ann_id:
+                ann_ch = guild.get_channel(int(vc_ann_id))
+                if isinstance(ann_ch, discord.abc.Messageable):
+                    targets.append(ann_ch)
+            if isinstance(source_channel, discord.abc.Messageable):
+                targets.append(source_channel)
+            if guild.system_channel is not None:
+                targets.append(guild.system_channel)
+            for tch in guild.text_channels:
+                if not db.is_channel_ignored(tch.id):
+                    targets.append(tch)
+                    break
+
+            for dest in targets:
+                try:
+                    sent_msg = await dest.send(content=winner.mention, embed=pub_embed, view=view)
+                    break
+                except discord.HTTPException:
+                    continue
 
         if sent_msg is not None:
             db.attach_message_url(key_id, sent_msg.jump_url)
 
         log_channel_id = db.get_setting("log_channel_id", None)
         if log_channel_id:
-            log_ch = trigger_message.guild.get_channel(int(log_channel_id))
+            log_ch = guild.get_channel(int(log_channel_id))
             if isinstance(log_ch, discord.TextChannel):
                 log_embed = discord.Embed(
                     title=f"📋 Key Drop Log — {format_tier_name(tier)}",
                     color=pub_color,
                     timestamp=discord.utils.utcnow(),
                 )
+                src_label = f"🔊 <#{source_channel.id}> (VC)" if is_vc else f"💬 <#{source_channel.id}>"
                 log_embed.add_field(name="Winner", value=f"{winner.mention} (`{winner.id}`)", inline=True)
-                log_embed.add_field(name="Channel", value=f"<#{trigger_message.channel.id}>", inline=True)
+                log_embed.add_field(name="Source", value=src_label, inline=True)
                 log_embed.add_field(name="Remaining Stock", value=f"`{remaining}`", inline=True)
-                log_embed.add_field(name="Key Delivered", value=f"```\n{key_text}\n```", inline=False)
+                short_key = key_text if len(key_text) <= 980 else key_text[:980] + "…"
+                log_embed.add_field(name="Key Delivered", value=f"```\n{short_key}\n```", inline=False)
                 if sent_msg is not None:
                     log_embed.add_field(name="Jump Link", value=sent_msg.jump_url, inline=False)
                 try:
@@ -894,7 +1095,7 @@ async def on_app_command_error(
 # =====================================================================
 
 
-@bot.tree.command(name="pirate", description="Check Pirate Token drop odds, stock, and your message roll stats")
+@bot.tree.command(name="pirate", description="Check Pirate Token drop odds, stock, and your roll stats")
 async def pirate_stats_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     user_stats = db.get_user_stats(interaction.user.id)
@@ -906,9 +1107,21 @@ async def pirate_stats_cmd(interaction: discord.Interaction) -> None:
     eff_1d = max(1, round(base_1d / mult))
     eff_lt = max(1, round(base_lt / mult))
 
+    vc_on = bool(db.get_setting("vc_enabled", True))
+    vc_sec = int(db.get_setting("vc_interval_seconds", 60))
+    vc_base_1d = max(1, int(db.get_setting("vc_odds_1day", 250)))
+    vc_base_lt = max(1, int(db.get_setting("vc_odds_lifetime", 500)))
+    eff_vc_1d = max(1, round(vc_base_1d / mult))
+    eff_vc_lt = max(1, round(vc_base_lt / mult))
+
+    desc = "Chat in text channels"
+    if vc_on:
+        desc += f" or hang out in Voice Channels (**1 roll every `{vc_sec}s`**)"
+    desc += " for a random chance to pull a script key!"
+
     embed = discord.Embed(
         title="🏴‍☠️ Pirate Token Drop Tracker",
-        description="Chat in any text channel for a random chance to pull a script key!",
+        description=desc,
         color=discord.Color.gold() if mult > 1.0 else discord.Color.blurple(),
     )
 
@@ -920,23 +1133,29 @@ async def pirate_stats_cmd(interaction: discord.Interaction) -> None:
         )
 
     show_stock = bool(db.get_setting("show_remaining_stock_publicly", True))
+    vc_1d_line = f"\nVC Odds: **`1 in {eff_vc_1d:,}`**" if vc_on else ""
+    vc_lt_line = f"\nVC Odds: **`1 in {eff_vc_lt:,}`**" if vc_on else ""
     stock_1d_txt = f"\nStock: **`{stock['1day']['available']} / {stock['1day']['cap']}`**" if show_stock else ""
     stock_lt_txt = f"\nStock: **`{stock['lifetime']['available']} / {stock['lifetime']['cap']}`**" if show_stock else ""
 
     embed.add_field(
         name="🗝️ 1-Day Script Key",
-        value=f"Odds: **`1 in {eff_1d:,}`**{stock_1d_txt}",
+        value=f"Chat Odds: **`1 in {eff_1d:,}`**{vc_1d_line}{stock_1d_txt}",
         inline=True,
     )
     embed.add_field(
         name="🏴‍☠️ Lifetime Pirate Token",
-        value=f"Odds: **`1 in {eff_lt:,}`**{stock_lt_txt}",
+        value=f"Chat Odds: **`1 in {eff_lt:,}`**{vc_lt_line}{stock_lt_txt}",
         inline=True,
     )
+
+    tot_rolls = int(user_stats.get("total_rolls", 0))
+    vc_rolls = int(user_stats.get("vc_rolls", 0))
+    chat_rolls = max(0, tot_rolls - vc_rolls)
     embed.add_field(
         name=f"📊 {interaction.user.display_name}'s Stats",
         value=(
-            f"• Messages Rolled: **`{user_stats['total_rolls']:,}`**\n"
+            f"• Total Rolls: **`{tot_rolls:,}`** *(Chat: `{chat_rolls:,}` | VC: `{vc_rolls:,}`)*\n"
             f"• 1-Day Keys Won: **`{user_stats['oneday_wins']}`**\n"
             f"• Lifetime Tokens Won: **`{user_stats['lifetime_wins']}`**"
         ),
@@ -951,16 +1170,21 @@ async def mykeys_cmd(interaction: discord.Interaction) -> None:
     won = db.get_user_claimed_keys(interaction.user.id)
     if not won:
         await interaction.followup.send(
-            "🏴‍☠️ You haven't pulled any keys yet — keep chatting in text channels to roll!",
+            "🏴‍☠️ You haven't pulled any keys yet — keep chatting or hanging out in VC to roll!",
             ephemeral=True,
         )
         return
 
     lines = []
+    total_chars = 0
     for item in won[:15]:
         ts = int(item["claimed_at"] or 0)
         tier_label = "🏴‍☠️ **Lifetime Key**" if item["tier"] == "lifetime" else "🗝️ **1-Day Key**"
-        lines.append(f"{tier_label} (<t:{ts}:R>):\n```\n{item['key_text']}\n```")
+        entry = f"{tier_label} (<t:{ts}:R>):\n```\n{item['key_text']}\n```"
+        if total_chars + len(entry) + 1 > 3900:
+            break
+        lines.append(entry)
+        total_chars += len(entry) + 1
 
     embed = discord.Embed(
         title="🔒 Your Claimed Keys",
@@ -1020,10 +1244,12 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
     stock = db.get_stock_counts()
     cfg = db.get_all_settings()
     mult, ends_at = db.get_active_multiplier()
-    recent = db.get_recent_winners(limit=8)
+    recent = db.get_recent_winners(limit=10)
 
     odds_1d = int(cfg.get("odds_1day", 500))
     odds_lt = int(cfg.get("odds_lifetime", 3000))
+    vc_odds_1d = int(cfg.get("vc_odds_1day", 250))
+    vc_odds_lt = int(cfg.get("vc_odds_lifetime", 500))
 
     embed = discord.Embed(title="🛠️ Admin Pirate Token Dashboard", color=discord.Color.gold())
     embed.add_field(
@@ -1031,7 +1257,8 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
         value=(
             f"• Available: **`{stock['1day']['available']} / {stock['1day']['cap']}`**\n"
             f"• Claimed: **`{stock['1day']['claimed']}`**\n"
-            f"• Base Odds: **`1 in {odds_1d:,}`**"
+            f"• Chat Odds: **`1 in {odds_1d:,}`**\n"
+            f"• VC Odds: **`1 in {vc_odds_1d:,}`**"
         ),
         inline=True,
     )
@@ -1040,41 +1267,103 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
         value=(
             f"• Available: **`{stock['lifetime']['available']} / {stock['lifetime']['cap']}`**\n"
             f"• Claimed: **`{stock['lifetime']['claimed']}`**\n"
-            f"• Base Odds: **`1 in {odds_lt:,}`**"
+            f"• Chat Odds: **`1 in {odds_lt:,}`**\n"
+            f"• VC Odds: **`1 in {vc_odds_lt:,}`**"
         ),
         inline=True,
     )
 
     ph_status = f"Active (`{mult:g}x` until <t:{int(ends_at)}:t>)" if mult > 1.0 else "Off (`1x`)"
     ignored = db.get_ignored_channels()
-    ignored_str = ", ".join(f"<#{cid}>" for cid in ignored) if ignored else "None"
+    if not ignored:
+        ignored_str = "None"
+    elif len(ignored) <= 10:
+        ignored_str = ", ".join(f"<#{cid}>" for cid in ignored)
+    else:
+        shown = ", ".join(f"<#{cid}>" for cid in ignored[:10])
+        ignored_str = f"{shown} (+{len(ignored) - 10} more)"
     log_ch = f"<#{cfg['log_channel_id']}>" if cfg.get("log_channel_id") else "Not set"
 
-    embed.add_field(
-        name="⚙️ Active Rules",
-        value=(
-            f"• Roll Cooldown: **`{cfg.get('roll_cooldown_seconds', 0)}s`**\n"
-            f"• 1 Lifetime Max / User: **`{cfg.get('one_lifetime_per_user', True)}`**\n"
-            f"• 1-Day Win Cooldown: **`{cfg.get('oneday_user_cooldown_hours', 24)}h`**\n"
-            f"• Power Hour: **{ph_status}**\n"
-            f"• Log Channel: {log_ch}\n"
-            f"• Ignored Channels: {ignored_str}"
-        ),
-        inline=False,
+    vc_on = bool(cfg.get("vc_enabled", True))
+    vc_sec = int(cfg.get("vc_interval_seconds", 60))
+    vc_min = int(cfg.get("vc_min_members", 2))
+    vc_ann = f" → <#{cfg['vc_announce_channel_id']}>" if cfg.get("vc_announce_channel_id") else " (in VC chat)"
+    vc_summary = f"On (every `{vc_sec}s`, min `{vc_min}` real users in VC){vc_ann}" if vc_on else "Off"
+
+    rules_val = (
+        f"• Chat Cooldown: **`{cfg.get('roll_cooldown_seconds', 0)}s`**\n"
+        f"• VC Drops: **{vc_summary}**\n"
+        f"• 1 Lifetime Max / User: **`{cfg.get('one_lifetime_per_user', True)}`**\n"
+        f"• 1-Day Win Cooldown: **`{cfg.get('oneday_user_cooldown_hours', 24)}h`**\n"
+        f"• Power Hour: **{ph_status}**\n"
+        f"• Log Channel: {log_ch}\n"
+        f"• Ignored Channels: {ignored_str}"
     )
+    embed.add_field(name="⚙️ Active Rules", value=rules_val[:1024], inline=False)
 
     if recent:
         win_lines = []
+        used_len = 0
         for w in recent:
             icon = "🏴‍☠️" if w["tier"] == "lifetime" else "🗝️"
             ts = int(w["claimed_at"] or 0)
             link = f" ([jump]({w['message_url']}))" if w.get("message_url") else ""
-            win_lines.append(f"{icon} <@{w['claimed_by_id']}> — <t:{ts}:R>{link}")
+            line = f"{icon} <@{w['claimed_by_id']}> — <t:{ts}:R>{link}"
+            if used_len + len(line) + 1 > 1000:
+                break
+            win_lines.append(line)
+            used_len += len(line) + 1
         embed.add_field(name="🏆 Recent Winners", value="\n".join(win_lines), inline=False)
     else:
         embed.add_field(name="🏆 Recent Winners", value="*No keys claimed yet.*", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="setvc", description="[Admin] Configure Voice Channel (VC) Pirate Token drop odds & rules")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    enabled="Enable or disable VC key drops (default: True)",
+    oneday_vc_one_in="1 in N chance per VC roll for 1-Day Key (default: 250)",
+    lifetime_vc_one_in="1 in N chance per VC roll for Lifetime Key (default: 500)",
+    interval_seconds="How often each VC user gets 1 roll in seconds (default: 60)",
+    min_members="Minimum real humans required in the same VC to roll (default: 2)",
+    ignore_deafened="Skip deafened users (default: False)",
+    ignore_muted="Skip mic-muted users (default: False)",
+    announce_channel="Optional text channel (like #general) to announce VC drops in",
+)
+async def setvc_cmd(
+    interaction: discord.Interaction,
+    enabled: bool = True,
+    oneday_vc_one_in: app_commands.Range[int, 1, 1000000] = 250,
+    lifetime_vc_one_in: app_commands.Range[int, 1, 1000000] = 500,
+    interval_seconds: app_commands.Range[int, 15, 3600] = 60,
+    min_members: app_commands.Range[int, 1, 50] = 2,
+    ignore_deafened: bool = False,
+    ignore_muted: bool = False,
+    announce_channel: Optional[discord.TextChannel] = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    db.set_setting("vc_enabled", enabled)
+    db.set_setting("vc_odds_1day", oneday_vc_one_in)
+    db.set_setting("vc_odds_lifetime", lifetime_vc_one_in)
+    db.set_setting("vc_interval_seconds", interval_seconds)
+    db.set_setting("vc_min_members", min_members)
+    db.set_setting("vc_ignore_deafened", ignore_deafened)
+    db.set_setting("vc_ignore_muted", ignore_muted)
+    db.set_setting("vc_announce_channel_id", announce_channel.id if announce_channel else None)
+
+    ann_txt = announce_channel.mention if announce_channel else "Voice Channel's own text chat"
+    await interaction.followup.send(
+        f"✅ **Voice Channel Drops Updated!**\n"
+        f"• Enabled: **`{enabled}`**\n"
+        f"• VC 1-Day Odds: **`1 in {oneday_vc_one_in:,}`** | VC Lifetime Odds: **`1 in {lifetime_vc_one_in:,}`**\n"
+        f"• Roll Interval: **1 roll every `{interval_seconds}s`**\n"
+        f"• Min Humans in VC: **`{min_members}`**\n"
+        f"• Ignore Deafened: **`{ignore_deafened}`** | Ignore Muted: **`{ignore_muted}`**\n"
+        f"• Drop Announcements: {ann_txt}",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="setodds", description="[Admin] Update 1-in-N drop odds live")
@@ -1172,19 +1461,19 @@ async def powerhour_cmd(
         embed = discord.Embed(
             title="⚡🏴‍☠️ PIRATE TOKEN POWER HOUR IS LIVE! 🏴‍☠️⚡",
             description=(
-                f"Drop chances in chat are boosted by **`{multiplier:g}x`** for the next **{duration_minutes} minutes**!\n"
-                f"⏳ Ends <t:{int(ends_at)}:R> — start chatting to hunt for keys!"
+                f"Drop chances in chat & Voice Channels are boosted by **`{multiplier:g}x`** for the next **{duration_minutes} minutes**!\n"
+                f"⏳ Ends <t:{int(ends_at)}:R> — chat or hop in VC to hunt for keys!"
             ),
             color=discord.Color.gold(),
         )
         await interaction.channel.send(embed=embed)
 
 
-@bot.tree.command(name="ignorechannel", description="[Admin] Toggle ignoring a channel so messages there don't roll keys")
+@bot.tree.command(name="ignorechannel", description="[Admin] Toggle ignoring a Text or Voice channel so it doesn't roll keys")
 @app_commands.default_permissions(administrator=True)
 async def ignorechannel_cmd(
     interaction: discord.Interaction,
-    channel: Optional[discord.TextChannel] = None,
+    channel: Optional[Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel]] = None,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
     target = channel or interaction.channel
@@ -1194,12 +1483,12 @@ async def ignorechannel_cmd(
     now_ignored = db.toggle_ignore_channel(target.id)
     if now_ignored:
         await interaction.followup.send(
-            f"🔇 <#{target.id}> is now **ignored** — messages there will not roll for keys.",
+            f"🔇 <#{target.id}> is now **ignored** — activity there will not roll for keys.",
             ephemeral=True,
         )
     else:
         await interaction.followup.send(
-            f"🔊 <#{target.id}> is **enabled** again — messages there can roll for keys!",
+            f"🔊 <#{target.id}> is **enabled** again — activity there can roll for keys!",
             ephemeral=True,
         )
 
