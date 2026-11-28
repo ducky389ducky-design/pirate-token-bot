@@ -6,12 +6,19 @@ import secrets
 import sqlite3
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
+
+# Ensure all print() logs appear immediately in Bothost Docker console
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 
 load_dotenv()
 
@@ -33,77 +40,101 @@ DEFAULT_CONFIG = {
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# On Bothost.ru, /app/data (or DATA_DIR) persists across restarts and Git updates
-DATA_DIR = os.getenv("DATA_DIR") or ("/app/data" if os.path.isdir("/app") else BASE_DIR)
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "pirate_bot.db")
+
+
+def _resolve_db_path() -> str:
+    candidates = []
+    if os.getenv("DATA_DIR"):
+        candidates.append(os.getenv("DATA_DIR", ""))
+    if os.path.isdir("/app"):
+        candidates.append("/app/data")
+    candidates.append(BASE_DIR)
+
+    for folder in candidates:
+        if not folder:
+            continue
+        try:
+            os.makedirs(folder, exist_ok=True)
+            test_file = os.path.join(folder, ".write_test")
+            with open(test_file, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_file)
+            return os.path.join(folder, "pirate_bot.db")
+        except Exception as exc:
+            print(f"[WARN] Data folder {folder} not writable ({exc}), trying fallback...")
+    return os.path.join(BASE_DIR, "pirate_bot.db")
+
+
+DB_PATH = _resolve_db_path()
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 SEED_1DAY_PATH = os.path.join(BASE_DIR, "keys_1day.txt")
 SEED_LIFETIME_PATH = os.path.join(BASE_DIR, "keys_lifetime.txt")
 
 
 # =====================================================================
-# SQLITE PERSISTENCE LAYER
+# SQLITE PERSISTENCE LAYER (FAST PERSISTENT CONNECTION)
 # =====================================================================
 
 
 class PirateDatabase:
-    """SQLite persistence layer for Pirate Token keys, settings, and user stats."""
+    """Fast SQLite persistence layer safe for Docker network/bind volumes."""
 
     def __init__(self, db_path: str = DB_PATH, config_path: str = CONFIG_PATH) -> None:
         self.db_path = db_path
         self.config_path = config_path
+        self._conn = sqlite3.connect(
+            self.db_path,
+            timeout=10.0,
+            isolation_level=None,  # Autocommit unless explicit transaction
+            check_same_thread=False,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=TRUNCATE;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn.execute("PRAGMA foreign_keys=ON;")
         self._init_db()
         self._seed_default_settings()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
-
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS keys (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tier TEXT NOT NULL CHECK(tier IN ('1day', 'lifetime')),
-                    key_text TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available', 'claimed')),
-                    added_at REAL NOT NULL,
-                    claimed_by_id INTEGER,
-                    claimed_by_name TEXT,
-                    claimed_at REAL,
-                    channel_id INTEGER,
-                    message_url TEXT
-                );
+            CREATE TABLE IF NOT EXISTS keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tier TEXT NOT NULL CHECK(tier IN ('1day', 'lifetime')),
+                key_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available', 'claimed')),
+                added_at REAL NOT NULL,
+                claimed_by_id INTEGER,
+                claimed_by_name TEXT,
+                claimed_at REAL,
+                channel_id INTEGER,
+                message_url TEXT
+            );
 
-                CREATE INDEX IF NOT EXISTS idx_keys_tier_status ON keys(tier, status);
-                CREATE INDEX IF NOT EXISTS idx_keys_claimed_by ON keys(claimed_by_id);
+            CREATE INDEX IF NOT EXISTS idx_keys_tier_status ON keys(tier, status);
+            CREATE INDEX IF NOT EXISTS idx_keys_claimed_by ON keys(claimed_by_id);
 
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    total_rolls INTEGER NOT NULL DEFAULT 0,
-                    last_roll_at REAL NOT NULL DEFAULT 0,
-                    oneday_wins INTEGER NOT NULL DEFAULT 0,
-                    lifetime_wins INTEGER NOT NULL DEFAULT 0,
-                    last_oneday_win_at REAL NOT NULL DEFAULT 0,
-                    last_lifetime_win_at REAL NOT NULL DEFAULT 0
-                );
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                total_rolls INTEGER NOT NULL DEFAULT 0,
+                last_roll_at REAL NOT NULL DEFAULT 0,
+                oneday_wins INTEGER NOT NULL DEFAULT 0,
+                lifetime_wins INTEGER NOT NULL DEFAULT 0,
+                last_oneday_win_at REAL NOT NULL DEFAULT 0,
+                last_lifetime_win_at REAL NOT NULL DEFAULT 0
+            );
 
-                CREATE TABLE IF NOT EXISTS ignored_channels (
-                    channel_id INTEGER PRIMARY KEY
-                );
-                """
-            )
+            CREATE TABLE IF NOT EXISTS ignored_channels (
+                channel_id INTEGER PRIMARY KEY
+            );
+            """
+        )
 
     def _seed_default_settings(self) -> None:
         merged = dict(DEFAULT_CONFIG)
@@ -119,34 +150,36 @@ class PirateDatabase:
         merged.setdefault("power_hour_multiplier", 1.0)
         merged.setdefault("power_hour_ends_at", 0.0)
 
-        with self._connect() as conn:
+        self._conn.execute("BEGIN")
+        try:
             for k, v in merged.items():
-                conn.execute(
+                self._conn.execute(
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                     (k, json.dumps(v)),
                 )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def get_setting(self, key: str, default: Any = None) -> Any:
-        with self._connect() as conn:
-            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-            if row is None:
-                return default
-            try:
-                return json.loads(row["value"])
-            except Exception:
-                return row["value"]
+        row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return row["value"]
 
     def set_setting(self, key: str, value: Any) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, json.dumps(value)),
-            )
+        self._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, json.dumps(value)),
+        )
 
     def get_all_settings(self) -> dict[str, Any]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT key, value FROM settings").fetchall()
+        rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
         result: dict[str, Any] = {}
         for row in rows:
             try:
@@ -156,37 +189,33 @@ class PirateDatabase:
         return result
 
     def is_channel_ignored(self, channel_id: int) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM ignored_channels WHERE channel_id = ?", (channel_id,)
-            ).fetchone()
-            return row is not None
+        row = self._conn.execute(
+            "SELECT 1 FROM ignored_channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        return row is not None
 
     def toggle_ignore_channel(self, channel_id: int) -> bool:
-        with self._connect() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM ignored_channels WHERE channel_id = ?", (channel_id,)
-            ).fetchone()
-            if exists:
-                conn.execute("DELETE FROM ignored_channels WHERE channel_id = ?", (channel_id,))
-                return False
-            conn.execute("INSERT INTO ignored_channels (channel_id) VALUES (?)", (channel_id,))
-            return True
+        exists = self._conn.execute(
+            "SELECT 1 FROM ignored_channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        if exists:
+            self._conn.execute("DELETE FROM ignored_channels WHERE channel_id = ?", (channel_id,))
+            return False
+        self._conn.execute("INSERT INTO ignored_channels (channel_id) VALUES (?)", (channel_id,))
+        return True
 
     def get_ignored_channels(self) -> list[int]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT channel_id FROM ignored_channels").fetchall()
-            return [int(r["channel_id"]) for r in rows]
+        rows = self._conn.execute("SELECT channel_id FROM ignored_channels").fetchall()
+        return [int(r["channel_id"]) for r in rows]
 
     def get_stock_counts(self) -> dict[str, dict[str, int]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT tier, status, COUNT(*) as cnt
-                FROM keys
-                GROUP BY tier, status
-                """
-            ).fetchall()
+        rows = self._conn.execute(
+            """
+            SELECT tier, status, COUNT(*) as cnt
+            FROM keys
+            GROUP BY tier, status
+            """
+        ).fetchall()
 
         stats = {
             "1day": {"available": 0, "claimed": 0, "cap": int(self.get_setting("max_stock_1day", 30))},
@@ -213,8 +242,9 @@ class PirateDatabase:
         cap = int(self.get_setting(cap_key, default_cap))
 
         now = time.time()
-        with self._connect() as conn:
-            cur_avail = conn.execute(
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur_avail = self._conn.execute(
                 "SELECT COUNT(*) AS cnt FROM keys WHERE tier = ? AND status = 'available'",
                 (tier,),
             ).fetchone()["cnt"]
@@ -228,18 +258,21 @@ class PirateDatabase:
                 skipped = 0
 
             if to_insert:
-                conn.executemany(
+                self._conn.executemany(
                     "INSERT INTO keys (tier, key_text, status, added_at) VALUES (?, ?, 'available', ?)",
                     [(tier, k, now) for k in to_insert],
                 )
-        return len(to_insert), skipped
+            self._conn.execute("COMMIT")
+            return len(to_insert), skipped
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def clear_available_keys(self, tier: str) -> int:
-        with self._connect() as conn:
-            cur = conn.execute(
-                "DELETE FROM keys WHERE tier = ? AND status = 'available'", (tier,)
-            )
-            return cur.rowcount
+        cur = self._conn.execute(
+            "DELETE FROM keys WHERE tier = ? AND status = 'available'", (tier,)
+        )
+        return cur.rowcount
 
     def import_seed_file(self, tier: str, filepath: str) -> int:
         path = Path(filepath)
@@ -319,26 +352,26 @@ class PirateDatabase:
         cooldown = float(self.get_setting("roll_cooldown_seconds", 0))
         now = time.time()
 
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
             if row is None:
-                conn.execute(
+                self._conn.execute(
                     """
                     INSERT INTO users (user_id, username, total_rolls, last_roll_at)
                     VALUES (?, ?, 1, ?)
                     """,
                     (user_id, username, now),
                 )
-                new_row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+                new_row = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+                self._conn.execute("COMMIT")
                 return True, dict(new_row)
 
             if cooldown > 0 and (now - float(row["last_roll_at"])) < cooldown:
-                conn.rollback()
+                self._conn.execute("ROLLBACK")
                 return False, dict(row)
 
-            conn.execute(
+            self._conn.execute(
                 """
                 UPDATE users
                 SET username = ?, total_rolls = total_rolls + 1, last_roll_at = ?
@@ -346,8 +379,12 @@ class PirateDatabase:
                 """,
                 (username, now, user_id),
             )
-            updated = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            updated = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            self._conn.execute("COMMIT")
             return True, dict(updated)
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def can_user_win(self, user_row: dict[str, Any], tier: str) -> bool:
         now = time.time()
@@ -368,21 +405,20 @@ class PirateDatabase:
         return False
 
     def has_available_key_for_user(self, tier: str, user_id: int) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM keys
-                WHERE tier = ?
-                  AND status = 'available'
-                  AND key_text NOT IN (
-                      SELECT key_text FROM keys
-                      WHERE status = 'claimed' AND claimed_by_id = ?
-                  )
-                LIMIT 1
-                """,
-                (tier, user_id),
-            ).fetchone()
-            return row is not None
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM keys
+            WHERE tier = ?
+              AND status = 'available'
+              AND key_text NOT IN (
+                  SELECT key_text FROM keys
+                  WHERE status = 'claimed' AND claimed_by_id = ?
+              )
+            LIMIT 1
+            """,
+            (tier, user_id),
+        ).fetchone()
+        return row is not None
 
     def claim_key_atomic(
         self,
@@ -392,9 +428,9 @@ class PirateDatabase:
         channel_id: int,
     ) -> Optional[dict[str, Any]]:
         now = time.time()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
                 """
                 SELECT id, tier, key_text
                 FROM keys
@@ -411,11 +447,11 @@ class PirateDatabase:
             ).fetchone()
 
             if row is None:
-                conn.rollback()
+                self._conn.execute("ROLLBACK")
                 return None
 
             key_id = int(row["id"])
-            conn.execute(
+            self._conn.execute(
                 """
                 UPDATE keys
                 SET status = 'claimed',
@@ -429,7 +465,7 @@ class PirateDatabase:
             )
 
             if tier == "lifetime":
-                conn.execute(
+                self._conn.execute(
                     """
                     UPDATE users
                     SET lifetime_wins = lifetime_wins + 1,
@@ -439,7 +475,7 @@ class PirateDatabase:
                     (now, user_id),
                 )
             else:
-                conn.execute(
+                self._conn.execute(
                     """
                     UPDATE users
                     SET oneday_wins = oneday_wins + 1,
@@ -449,11 +485,12 @@ class PirateDatabase:
                     (now, user_id),
                 )
 
-            remaining = conn.execute(
+            remaining = self._conn.execute(
                 "SELECT COUNT(*) AS cnt FROM keys WHERE tier = ? AND status = 'available'",
                 (tier,),
             ).fetchone()["cnt"]
 
+            self._conn.execute("COMMIT")
             return {
                 "id": key_id,
                 "tier": row["tier"],
@@ -463,54 +500,52 @@ class PirateDatabase:
                 "claimed_at": now,
                 "remaining": int(remaining),
             }
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def attach_message_url(self, key_id: int, message_url: str) -> None:
-        with self._connect() as conn:
-            conn.execute("UPDATE keys SET message_url = ? WHERE id = ?", (message_url, key_id))
+        self._conn.execute("UPDATE keys SET message_url = ? WHERE id = ?", (message_url, key_id))
 
     def get_key_by_id(self, key_id: int) -> Optional[dict[str, Any]]:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM keys WHERE id = ?", (key_id,)).fetchone()
-            return dict(row) if row else None
+        row = self._conn.execute("SELECT * FROM keys WHERE id = ?", (key_id,)).fetchone()
+        return dict(row) if row else None
 
     def get_user_stats(self, user_id: int) -> dict[str, Any]:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-            if row is None:
-                return {
-                    "user_id": user_id,
-                    "total_rolls": 0,
-                    "oneday_wins": 0,
-                    "lifetime_wins": 0,
-                }
-            return dict(row)
+        row = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            return {
+                "user_id": user_id,
+                "total_rolls": 0,
+                "oneday_wins": 0,
+                "lifetime_wins": 0,
+            }
+        return dict(row)
 
     def get_user_claimed_keys(self, user_id: int) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, tier, key_text, claimed_at, message_url
-                FROM keys
-                WHERE status = 'claimed' AND claimed_by_id = ?
-                ORDER BY claimed_at DESC
-                """,
-                (user_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+        rows = self._conn.execute(
+            """
+            SELECT id, tier, key_text, claimed_at, message_url
+            FROM keys
+            WHERE status = 'claimed' AND claimed_by_id = ?
+            ORDER BY claimed_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_recent_winners(self, limit: int = 10) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, tier, claimed_by_id, claimed_by_name, claimed_at, message_url
-                FROM keys
-                WHERE status = 'claimed'
-                ORDER BY claimed_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+        rows = self._conn.execute(
+            """
+            SELECT id, tier, claimed_by_id, claimed_by_name, claimed_at, message_url
+            FROM keys
+            WHERE status = 'claimed'
+            ORDER BY claimed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_active_multiplier(self) -> tuple[float, float]:
         mult = float(self.get_setting("power_hour_multiplier", 1.0))
@@ -591,23 +626,22 @@ class ClaimKeyButton(
         return cls(int(match["key_id"]))
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         record = db.get_key_by_id(self.key_id)
         if not record or record.get("status") != "claimed":
-            await interaction.response.send_message(
-                "⚠️ Could not find this key record.", ephemeral=True
-            )
+            await interaction.followup.send("⚠️ Could not find this key record.", ephemeral=True)
             return
 
         winner_id = int(record["claimed_by_id"])
         if interaction.user.id != winner_id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🏴‍☠️ Hands off, matey! This treasure belongs to <@{winner_id}> — keep chatting to find your own!",
                 ephemeral=True,
             )
             return
 
         embed = build_private_key_embed(record["tier"], record["key_text"])
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class AddKeysModal(discord.ui.Modal):
@@ -628,6 +662,7 @@ class AddKeysModal(discord.ui.Modal):
         self.ignore_cap = ignore_cap
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         lines = [line.strip() for line in self.keys_input.value.splitlines() if line.strip()]
         added, skipped = db.add_keys(self.tier, lines, enforce_cap=not self.ignore_cap)
         stock = db.get_stock_counts()[self.tier]
@@ -641,7 +676,7 @@ class AddKeysModal(discord.ui.Modal):
                 f"\n⚠️ Skipped **{skipped}** key(s) because the stock cap (`{stock['cap']}`) was reached. "
                 f"Use `/setstockcap` if you want to raise the limit."
             )
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
 
 
 class PirateBot(discord.Client):
@@ -652,6 +687,7 @@ class PirateBot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self._synced_guilds: set[int] = set()
 
     async def setup_hook(self) -> None:
         imported_1d = db.import_seed_file("1day", SEED_1DAY_PATH)
@@ -663,16 +699,8 @@ class PirateBot(discord.Client):
             print(f"[SEED] Imported {tot_1d} 1-Day key(s) and {tot_lt} Lifetime key(s) into {DB_PATH}.")
 
         self.add_dynamic_items(ClaimKeyButton)
-
-        guild_id_env = os.getenv("DISCORD_GUILD_ID", "").strip()
-        if guild_id_env.isdigit():
-            guild_obj = discord.Object(id=int(guild_id_env))
-            self.tree.copy_global_to(guild=guild_obj)
-            await self.tree.sync(guild=guild_obj)
-            print(f"[SYNC] Synced slash commands instantly to guild {guild_id_env}.")
-        else:
-            await self.tree.sync()
-            print("[SYNC] Synced global slash commands.")
+        await self.tree.sync()
+        print("[SYNC] Synced global slash commands.")
 
     async def on_ready(self) -> None:
         stock = db.get_stock_counts()
@@ -681,6 +709,7 @@ class PirateBot(discord.Client):
         cooldown = db.get_setting("roll_cooldown_seconds", 0)
         print("=" * 58)
         print(f"🏴‍☠️ Pirate Token Bot is ONLINE as {self.user} (ID: {self.user.id})")
+        print(f"   • Guilds Connected  : {[g.name for g in self.guilds]}")
         print(f"   • 1-Day Key Odds    : 1 in {odds_1d} | Stock: {stock['1day']['available']}/{stock['1day']['cap']}")
         print(f"   • Lifetime Key Odds : 1 in {odds_lt} | Stock: {stock['lifetime']['available']}/{stock['lifetime']['cap']}")
         print(f"   • Roll Cooldown     : {cooldown}s")
@@ -844,13 +873,30 @@ class PirateBot(discord.Client):
 bot = PirateBot()
 
 
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    print(f"[ERROR] Slash command /{interaction.command.name if interaction.command else '?'} failed:")
+    traceback.print_exception(type(error), error, error.__traceback__)
+    err_msg = f"⚠️ Command error: `{error}`"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(err_msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(err_msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 # =====================================================================
-# SLASH COMMANDS
+# SLASH COMMANDS (WITH INSTANT DEFER SO DISCORD NEVER TIMES OUT)
 # =====================================================================
 
 
 @bot.tree.command(name="pirate", description="Check Pirate Token drop odds, stock, and your message roll stats")
 async def pirate_stats_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.defer()
     user_stats = db.get_user_stats(interaction.user.id)
     stock = db.get_stock_counts()
     mult, ends_at = db.get_active_multiplier()
@@ -896,14 +942,15 @@ async def pirate_stats_cmd(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="mykeys", description="Privately view any script keys you have won")
 async def mykeys_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
     won = db.get_user_claimed_keys(interaction.user.id)
     if not won:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🏴‍☠️ You haven't pulled any keys yet — keep chatting in text channels to roll!",
             ephemeral=True,
         )
@@ -920,7 +967,7 @@ async def mykeys_cmd(interaction: discord.Interaction) -> None:
         description="\n".join(lines),
         color=discord.Color.gold(),
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="addkeys", description="[Admin] Open a private form to paste unique 1-Day or Lifetime keys")
@@ -953,6 +1000,7 @@ async def addsharedkey_cmd(
     key_message: str,
     copies: app_commands.Range[int, 1, 500],
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     added, skipped = db.add_keys(tier, [key_message] * copies, enforce_cap=True)
     stock = db.get_stock_counts()[tier]
     msg = (
@@ -962,16 +1010,20 @@ async def addsharedkey_cmd(
     )
     if skipped > 0:
         msg += f"\n⚠️ `{skipped}` copy/copies skipped due to stock cap (`{stock['cap']}`). Use `/setstockcap` to raise it."
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="stock", description="[Admin] View remaining key stock, current settings, and recent winners")
 @app_commands.default_permissions(administrator=True)
 async def stock_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
     stock = db.get_stock_counts()
     cfg = db.get_all_settings()
     mult, ends_at = db.get_active_multiplier()
     recent = db.get_recent_winners(limit=8)
+
+    odds_1d = int(cfg.get("odds_1day", 500))
+    odds_lt = int(cfg.get("odds_lifetime", 3000))
 
     embed = discord.Embed(title="🛠️ Admin Pirate Token Dashboard", color=discord.Color.gold())
     embed.add_field(
@@ -979,7 +1031,7 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
         value=(
             f"• Available: **`{stock['1day']['available']} / {stock['1day']['cap']}`**\n"
             f"• Claimed: **`{stock['1day']['claimed']}`**\n"
-            f"• Base Odds: **`1 in {cfg.get('odds_1day', 500):,}`**"
+            f"• Base Odds: **`1 in {odds_1d:,}`**"
         ),
         inline=True,
     )
@@ -988,7 +1040,7 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
         value=(
             f"• Available: **`{stock['lifetime']['available']} / {stock['lifetime']['cap']}`**\n"
             f"• Claimed: **`{stock['lifetime']['claimed']}`**\n"
-            f"• Base Odds: **`1 in {cfg.get('odds_lifetime', 3000):,}`**"
+            f"• Base Odds: **`1 in {odds_lt:,}`**"
         ),
         inline=True,
     )
@@ -1022,7 +1074,7 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
     else:
         embed.add_field(name="🏆 Recent Winners", value="*No keys claimed yet.*", inline=False)
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="setodds", description="[Admin] Update 1-in-N drop odds live")
@@ -1036,9 +1088,10 @@ async def setodds_cmd(
     oneday_one_in: app_commands.Range[int, 1, 1000000],
     lifetime_one_in: app_commands.Range[int, 1, 1000000],
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     db.set_setting("odds_1day", oneday_one_in)
     db.set_setting("odds_lifetime", lifetime_one_in)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Drop odds updated!\n"
         f"• **1-Day Key:** `1 in {oneday_one_in:,}`\n"
         f"• **Lifetime Key:** `1 in {lifetime_one_in:,}`",
@@ -1053,9 +1106,10 @@ async def setstockcap_cmd(
     oneday_cap: app_commands.Range[int, 1, 10000],
     lifetime_cap: app_commands.Range[int, 1, 10000],
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     db.set_setting("max_stock_1day", oneday_cap)
     db.set_setting("max_stock_lifetime", lifetime_cap)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Max stock caps updated!\n"
         f"• **1-Day Max Stock:** `{oneday_cap}`\n"
         f"• **Lifetime Max Stock:** `{lifetime_cap}`",
@@ -1070,9 +1124,10 @@ async def setcooldown_cmd(
     roll_cooldown_seconds: app_commands.Range[float, 0.0, 3600.0],
     oneday_win_cooldown_hours: app_commands.Range[float, 0.0, 720.0] = 24.0,
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     db.set_setting("roll_cooldown_seconds", roll_cooldown_seconds)
     db.set_setting("oneday_user_cooldown_hours", oneday_win_cooldown_hours)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Cooldowns updated!\n"
         f"• **Message Roll Cooldown:** `{roll_cooldown_seconds:g}s`\n"
         f"• **1-Day Repeat Win Cooldown:** `{oneday_win_cooldown_hours:g}h`",
@@ -1086,8 +1141,9 @@ async def clearstock_cmd(
     interaction: discord.Interaction,
     tier: Literal["1day", "lifetime"],
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     removed = db.clear_available_keys(tier)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"🗑️ Cleared **{removed}** unclaimed key(s) from **{format_tier_name(tier)}**.",
         ephemeral=True,
     )
@@ -1101,13 +1157,14 @@ async def powerhour_cmd(
     duration_minutes: app_commands.Range[int, 1, 1440] = 60,
     announce_here: bool = True,
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     if multiplier <= 1.0:
         db.set_power_hour(1.0, 0)
-        await interaction.response.send_message("⏹️ Power Hour turned **OFF** (back to normal odds).", ephemeral=True)
+        await interaction.followup.send("⏹️ Power Hour turned **OFF** (back to normal odds).", ephemeral=True)
         return
 
     ends_at = db.set_power_hour(multiplier, duration_minutes)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"⚡ Power Hour started: **`{multiplier:g}x` odds** until <t:{int(ends_at)}:t>!",
         ephemeral=True,
     )
@@ -1129,18 +1186,19 @@ async def ignorechannel_cmd(
     interaction: discord.Interaction,
     channel: Optional[discord.TextChannel] = None,
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     target = channel or interaction.channel
     if target is None:
-        await interaction.response.send_message("⚠️ Invalid channel.", ephemeral=True)
+        await interaction.followup.send("⚠️ Invalid channel.", ephemeral=True)
         return
     now_ignored = db.toggle_ignore_channel(target.id)
     if now_ignored:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"🔇 <#{target.id}> is now **ignored** — messages there will not roll for keys.",
             ephemeral=True,
         )
     else:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"🔊 <#{target.id}> is **enabled** again — messages there can roll for keys!",
             ephemeral=True,
         )
@@ -1152,12 +1210,13 @@ async def setlogchannel_cmd(
     interaction: discord.Interaction,
     channel: Optional[discord.TextChannel] = None,
 ) -> None:
+    await interaction.response.defer(ephemeral=True)
     if channel is None:
         db.set_setting("log_channel_id", None)
-        await interaction.response.send_message("📋 Drop log channel disabled.", ephemeral=True)
+        await interaction.followup.send("📋 Drop log channel disabled.", ephemeral=True)
     else:
         db.set_setting("log_channel_id", channel.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"📋 Drop logs will now be sent to {channel.mention}.", ephemeral=True
         )
 
