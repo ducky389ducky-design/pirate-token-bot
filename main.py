@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import sqlite3
 import sys
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
@@ -24,8 +26,11 @@ if hasattr(sys.stderr, "reconfigure"):
 load_dotenv()
 
 # =====================================================================
-# DEFAULT CONFIGURATION
+# DEFAULT CONFIGURATION & HARD ODDS SAFETY FLOORS
 # =====================================================================
+
+MIN_BASE_ODDS = 50       # Base odds can NEVER go below 1 in 50 (prevents accidental 1-in-2 wipeouts)
+MIN_EFFECTIVE_ODDS = 25  # Even during Power Hour, odds can NEVER go below 1 in 25
 
 DEFAULT_CONFIG = {
     "odds_1day": 500,                  # 1 in 500 chance per roll
@@ -184,6 +189,31 @@ class PirateDatabase:
             self.set_setting("vc_ignore_muted", False)
             self.set_setting("vc_ignore_deafened", False)
             self.set_setting("vc_v2_migrated", True)
+
+        self._sanitize_odds_settings()
+
+    def _sanitize_odds_settings(self) -> None:
+        """Auto-heals any dangerously low (< 50, e.g. 1-in-2) odds or stale Power Hour state in SQLite."""
+        safe_defaults = {
+            "odds_1day": 500,
+            "odds_lifetime": 3000,
+            "vc_odds_1day": 250,
+            "vc_odds_lifetime": 500,
+        }
+        for key, fallback in safe_defaults.items():
+            raw_val = self.get_setting(key, fallback)
+            try:
+                val = int(raw_val)
+            except (TypeError, ValueError):
+                val = 0
+            if val < MIN_BASE_ODDS:
+                print(
+                    f"[SAFETY] Healing unsafe setting {key}={raw_val!r} (< {MIN_BASE_ODDS}) -> restored to {fallback}!"
+                )
+                self.set_setting(key, fallback)
+
+        # Ensure expired or invalid Power Hour multiplier is cleanly reset to 1.0
+        self.get_active_multiplier()
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -590,7 +620,7 @@ class PirateDatabase:
     def get_recent_winners(self, limit: int = 10) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             """
-            SELECT id, tier, claimed_by_id, claimed_by_name, claimed_at, message_url
+            SELECT id, tier, key_text, claimed_by_id, claimed_by_name, claimed_at, message_url
             FROM keys
             WHERE status = 'claimed'
             ORDER BY claimed_at DESC
@@ -600,22 +630,96 @@ class PirateDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_claimed_keys_filtered(
+        self,
+        tier: Optional[str] = None,
+        user_id: Optional[int] = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses = ["status = 'claimed'"]
+        params: list[Any] = []
+        if tier in ("1day", "lifetime"):
+            clauses.append("tier = ?")
+            params.append(tier)
+        if user_id is not None:
+            clauses.append("claimed_by_id = ?")
+            params.append(user_id)
+        params.append(limit)
+        sql = (
+            f"SELECT id, tier, key_text, claimed_by_id, claimed_by_name, claimed_at, message_url "
+            f"FROM keys WHERE {' AND '.join(clauses)} ORDER BY claimed_at DESC LIMIT ?"
+        )
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def reset_user_wins(self, user_id: Optional[int] = None) -> int:
+        if user_id is not None:
+            cur = self._conn.execute(
+                """
+                UPDATE users
+                SET oneday_wins = 0,
+                    lifetime_wins = 0,
+                    last_oneday_win_at = 0,
+                    last_lifetime_win_at = 0
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            )
+            return cur.rowcount
+        cur = self._conn.execute(
+            """
+            UPDATE users
+            SET oneday_wins = 0,
+                lifetime_wins = 0,
+                last_oneday_win_at = 0,
+                last_lifetime_win_at = 0
+            """
+        )
+        return cur.rowcount
+
     def get_active_multiplier(self) -> tuple[float, float]:
-        mult = float(self.get_setting("power_hour_multiplier", 1.0))
-        ends_at = float(self.get_setting("power_hour_ends_at", 0.0))
-        if mult <= 1.0 or ends_at <= time.time():
+        try:
+            mult = float(self.get_setting("power_hour_multiplier", 1.0))
+            ends_at = float(self.get_setting("power_hour_ends_at", 0.0))
+        except (TypeError, ValueError):
+            self.set_setting("power_hour_multiplier", 1.0)
+            self.set_setting("power_hour_ends_at", 0.0)
             return 1.0, 0.0
-        return mult, ends_at
+
+        if mult <= 1.0 or ends_at <= time.time():
+            if mult != 1.0 or ends_at != 0.0:
+                self.set_setting("power_hour_multiplier", 1.0)
+                self.set_setting("power_hour_ends_at", 0.0)
+            return 1.0, 0.0
+        return min(mult, 10.0), ends_at
 
     def set_power_hour(self, multiplier: float, duration_minutes: int) -> float:
         if multiplier <= 1.0 or duration_minutes <= 0:
             self.set_setting("power_hour_multiplier", 1.0)
             self.set_setting("power_hour_ends_at", 0.0)
             return 0.0
+        safe_mult = min(float(multiplier), 10.0)
         ends_at = time.time() + (duration_minutes * 60.0)
-        self.set_setting("power_hour_multiplier", multiplier)
+        self.set_setting("power_hour_multiplier", safe_mult)
         self.set_setting("power_hour_ends_at", ends_at)
         return ends_at
+
+    def get_effective_odds(self, source: Literal["chat", "vc"] = "chat") -> tuple[int, int, float, float]:
+        """Returns (effective_1day_odds, effective_lifetime_odds, active_multiplier, ends_at) with hard safety floors."""
+        mult, ends_at = self.get_active_multiplier()
+        if source == "vc":
+            base_1d = max(MIN_BASE_ODDS, int(self.get_setting("vc_odds_1day", 250)))
+            base_lt = max(MIN_BASE_ODDS, int(self.get_setting("vc_odds_lifetime", 500)))
+        else:
+            base_1d = max(MIN_BASE_ODDS, int(self.get_setting("odds_1day", 500)))
+            base_lt = max(MIN_BASE_ODDS, int(self.get_setting("odds_lifetime", 3000)))
+
+        if mult <= 1.0:
+            return base_1d, base_lt, 1.0, 0.0
+
+        eff_1d = max(MIN_EFFECTIVE_ODDS, round(base_1d / mult))
+        eff_lt = max(MIN_EFFECTIVE_ODDS, round(base_lt / mult))
+        return eff_1d, eff_lt, mult, ends_at
 
 
 db = PirateDatabase()
@@ -657,7 +761,7 @@ class ClaimKeyButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"pirate_claim:(?P<key_id>[0-9]+)",
 ):
-    """Persistent button allowing ONLY the drop winner to view their key privately."""
+    """Persistent button allowing the drop winner (or Server Admins) to view the key privately."""
 
     def __init__(self, key_id: int) -> None:
         super().__init__(
@@ -687,11 +791,30 @@ class ClaimKeyButton(
             return
 
         winner_id = int(record["claimed_by_id"])
-        if interaction.user.id != winner_id:
+        is_admin = (
+            isinstance(interaction.user, discord.Member)
+            and interaction.user.guild_permissions.administrator
+        )
+
+        if interaction.user.id != winner_id and not is_admin:
             await interaction.followup.send(
                 f"🏴‍☠️ Hands off, matey! This treasure belongs to <@{winner_id}> — keep chatting or hanging in VC to find your own!",
                 ephemeral=True,
             )
+            return
+
+        if interaction.user.id != winner_id and is_admin:
+            ts = int(record.get("claimed_at") or 0)
+            adm_embed = discord.Embed(
+                title=f"🛠️ Admin Key Inspector — {format_tier_name(record['tier'])}",
+                description=(
+                    f"**Winner:** <@{winner_id}> (`{record.get('claimed_by_name', winner_id)}`)\n"
+                    f"**Claimed:** <t:{ts}:R>\n"
+                    f"**Key Delivered:**\n```\n{record['key_text']}\n```"
+                )[:4090],
+                color=discord.Color.gold(),
+            )
+            await interaction.followup.send(embed=adm_embed, ephemeral=True)
             return
 
         embed = build_private_key_embed(record["tier"], record["key_text"])
@@ -808,16 +931,10 @@ class PirateBot(discord.Client):
         trigger_message: Optional[discord.Message] = None,
         source: Literal["chat", "vc"] = "chat",
     ) -> None:
-        multiplier, _ = db.get_active_multiplier()
-        lt_setting_key = "vc_odds_lifetime" if source == "vc" else "odds_lifetime"
-        lt_default = 500 if source == "vc" else 3000
-        oneday_setting_key = "vc_odds_1day" if source == "vc" else "odds_1day"
-        oneday_default = 250 if source == "vc" else 500
+        effective_1d_odds, effective_lt_odds, _, _ = db.get_effective_odds(source=source)
 
         # 1) Roll for LIFETIME Pirate Token first (Jackpot)
         if db.can_user_win(user_row, "lifetime") and db.has_available_key_for_user("lifetime", user.id):
-            base_lt_odds = max(1, int(db.get_setting(lt_setting_key, lt_default)))
-            effective_lt_odds = max(1, round(base_lt_odds / multiplier))
             if secrets.randbelow(effective_lt_odds) == 0:
                 claimed = db.claim_key_atomic(
                     tier="lifetime",
@@ -840,8 +957,6 @@ class PirateBot(discord.Client):
 
         # 2) Roll for 1-DAY Script Key second
         if db.can_user_win(user_row, "1day") and db.has_available_key_for_user("1day", user.id):
-            base_1d_odds = max(1, int(db.get_setting(oneday_setting_key, oneday_default)))
-            effective_1d_odds = max(1, round(base_1d_odds / multiplier))
             if secrets.randbelow(effective_1d_odds) == 0:
                 claimed = db.claim_key_atomic(
                     tier="1day",
@@ -1100,19 +1215,11 @@ async def pirate_stats_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     user_stats = db.get_user_stats(interaction.user.id)
     stock = db.get_stock_counts()
-    mult, ends_at = db.get_active_multiplier()
-
-    base_1d = max(1, int(db.get_setting("odds_1day", 500)))
-    base_lt = max(1, int(db.get_setting("odds_lifetime", 3000)))
-    eff_1d = max(1, round(base_1d / mult))
-    eff_lt = max(1, round(base_lt / mult))
+    eff_1d, eff_lt, mult, ends_at = db.get_effective_odds("chat")
+    eff_vc_1d, eff_vc_lt, _, _ = db.get_effective_odds("vc")
 
     vc_on = bool(db.get_setting("vc_enabled", True))
     vc_sec = int(db.get_setting("vc_interval_seconds", 60))
-    vc_base_1d = max(1, int(db.get_setting("vc_odds_1day", 250)))
-    vc_base_lt = max(1, int(db.get_setting("vc_odds_lifetime", 500)))
-    eff_vc_1d = max(1, round(vc_base_1d / mult))
-    eff_vc_lt = max(1, round(vc_base_lt / mult))
 
     desc = "Chat in text channels"
     if vc_on:
@@ -1237,19 +1344,15 @@ async def addsharedkey_cmd(
     await interaction.followup.send(msg, ephemeral=True)
 
 
-@bot.tree.command(name="stock", description="[Admin] View remaining key stock, current settings, and recent winners")
+@bot.tree.command(name="stock", description="[Admin] View remaining key stock, current settings, and recent winners + keys")
 @app_commands.default_permissions(administrator=True)
 async def stock_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     stock = db.get_stock_counts()
     cfg = db.get_all_settings()
-    mult, ends_at = db.get_active_multiplier()
+    eff_1d, eff_lt, mult, ends_at = db.get_effective_odds("chat")
+    eff_vc_1d, eff_vc_lt, _, _ = db.get_effective_odds("vc")
     recent = db.get_recent_winners(limit=10)
-
-    odds_1d = int(cfg.get("odds_1day", 500))
-    odds_lt = int(cfg.get("odds_lifetime", 3000))
-    vc_odds_1d = int(cfg.get("vc_odds_1day", 250))
-    vc_odds_lt = int(cfg.get("vc_odds_lifetime", 500))
 
     embed = discord.Embed(title="🛠️ Admin Pirate Token Dashboard", color=discord.Color.gold())
     embed.add_field(
@@ -1257,8 +1360,8 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
         value=(
             f"• Available: **`{stock['1day']['available']} / {stock['1day']['cap']}`**\n"
             f"• Claimed: **`{stock['1day']['claimed']}`**\n"
-            f"• Chat Odds: **`1 in {odds_1d:,}`**\n"
-            f"• VC Odds: **`1 in {vc_odds_1d:,}`**"
+            f"• Chat Odds: **`1 in {eff_1d:,}`**\n"
+            f"• VC Odds: **`1 in {eff_vc_1d:,}`**"
         ),
         inline=True,
     )
@@ -1267,8 +1370,8 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
         value=(
             f"• Available: **`{stock['lifetime']['available']} / {stock['lifetime']['cap']}`**\n"
             f"• Claimed: **`{stock['lifetime']['claimed']}`**\n"
-            f"• Chat Odds: **`1 in {odds_lt:,}`**\n"
-            f"• VC Odds: **`1 in {vc_odds_lt:,}`**"
+            f"• Chat Odds: **`1 in {eff_lt:,}`**\n"
+            f"• VC Odds: **`1 in {eff_vc_lt:,}`**"
         ),
         inline=True,
     )
@@ -1304,240 +1407,398 @@ async def stock_cmd(interaction: discord.Interaction) -> None:
     if recent:
         win_lines = []
         used_len = 0
+        footer_hint = "*Use `/winners` for full key list & `.txt` export*"
         for w in recent:
             icon = "🏴‍☠️" if w["tier"] == "lifetime" else "🗝️"
             ts = int(w["claimed_at"] or 0)
+            raw_key = str(w.get("key_text", "")).replace("`", "'").replace("\n", " ").strip()
+            short_key = raw_key if len(raw_key) <= 34 else raw_key[:31] + "..."
             link = f" ([jump]({w['message_url']}))" if w.get("message_url") else ""
-            line = f"{icon} <@{w['claimed_by_id']}> — <t:{ts}:R>{link}"
-            if used_len + len(line) + 1 > 1000:
+            line = f"{icon} <@{w['claimed_by_id']}>: `{short_key}` — <t:{ts}:R>{link}"
+            if used_len + len(line) + len(footer_hint) + 4 > 1000:
                 break
             win_lines.append(line)
             used_len += len(line) + 1
-        embed.add_field(name="🏆 Recent Winners", value="\n".join(win_lines), inline=False)
+        win_lines.append(footer_hint)
+        embed.add_field(name="🏆 Recent Winners & Keys", value="\n".join(win_lines), inline=False)
     else:
-        embed.add_field(name="🏆 Recent Winners", value="*No keys claimed yet.*", inline=False)
+        embed.add_field(name="🏆 Recent Winners & Keys", value="*No keys claimed yet.*", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="setvc", description="[Admin] Configure Voice Channel (VC) Pirate Token drop odds & rules")
+@bot.tree.command(
+    name="winners",
+    description="[Admin] Privately view who got which exact key (filter by user or tier + full .txt file)",
+)
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    enabled="Enable or disable VC key drops (default: True)",
-    oneday_vc_one_in="1 in N chance per VC roll for 1-Day Key (default: 250)",
-    lifetime_vc_one_in="1 in N chance per VC roll for Lifetime Key (default: 500)",
-    interval_seconds="How often each VC user gets 1 roll in seconds (default: 60)",
-    min_members="Minimum real humans required in the same VC to roll (default: 2)",
-    ignore_deafened="Skip deafened users (default: False)",
-    ignore_muted="Skip mic-muted users (default: False)",
-    announce_channel="Optional text channel (like #general) to announce VC drops in",
+    user="Optional: view all keys won by one specific user",
+    tier="Filter by All, Lifetime Pirate Token, or 1-Day Key",
 )
-async def setvc_cmd(
+async def winners_cmd(
     interaction: discord.Interaction,
-    enabled: bool = True,
-    oneday_vc_one_in: app_commands.Range[int, 1, 1000000] = 250,
-    lifetime_vc_one_in: app_commands.Range[int, 1, 1000000] = 500,
-    interval_seconds: app_commands.Range[int, 15, 3600] = 60,
-    min_members: app_commands.Range[int, 1, 50] = 2,
-    ignore_deafened: bool = False,
-    ignore_muted: bool = False,
-    announce_channel: Optional[discord.TextChannel] = None,
+    user: Optional[discord.Member] = None,
+    tier: Literal["all", "lifetime", "1day"] = "all",
 ) -> None:
     await interaction.response.defer(ephemeral=True)
-    db.set_setting("vc_enabled", enabled)
-    db.set_setting("vc_odds_1day", oneday_vc_one_in)
-    db.set_setting("vc_odds_lifetime", lifetime_vc_one_in)
-    db.set_setting("vc_interval_seconds", interval_seconds)
-    db.set_setting("vc_min_members", min_members)
-    db.set_setting("vc_ignore_deafened", ignore_deafened)
-    db.set_setting("vc_ignore_muted", ignore_muted)
-    db.set_setting("vc_announce_channel_id", announce_channel.id if announce_channel else None)
+    tier_filter = None if tier == "all" else tier
+    uid_filter = user.id if user is not None else None
+    rows = db.get_claimed_keys_filtered(tier=tier_filter, user_id=uid_filter, limit=500)
 
-    ann_txt = announce_channel.mention if announce_channel else "Voice Channel's own text chat"
-    await interaction.followup.send(
-        f"✅ **Voice Channel Drops Updated!**\n"
-        f"• Enabled: **`{enabled}`**\n"
-        f"• VC 1-Day Odds: **`1 in {oneday_vc_one_in:,}`** | VC Lifetime Odds: **`1 in {lifetime_vc_one_in:,}`**\n"
-        f"• Roll Interval: **1 roll every `{interval_seconds}s`**\n"
-        f"• Min Humans in VC: **`{min_members}`**\n"
-        f"• Ignore Deafened: **`{ignore_deafened}`** | Ignore Muted: **`{ignore_muted}`**\n"
-        f"• Drop Announcements: {ann_txt}",
-        ephemeral=True,
-    )
+    if not rows:
+        await interaction.followup.send("📭 No claimed keys match that filter yet.", ephemeral=True)
+        return
+
+    embed_lines: list[str] = []
+    txt_lines: list[str] = [
+        "=== PIRATE TOKEN BOT — CLAIMED KEYS REPORT ===",
+        f"Total Matching Claimed Keys: {len(rows)}",
+        "=" * 56,
+        "",
+    ]
+    used_chars = 0
+    hidden_count = 0
+
+    for item in rows:
+        kid = item["id"]
+        is_lt = item["e it."
+    await intkey = raw_kt_liue)fNnbed_..canliue)fNnbed_..>: `{shor{cfg.get(M= []r
+asyncyy:
+                    await log_ch.senduser_rolls: int,
+        tv)tr{cfg.getg.get(M= []r
+asynxenduser_rolls: int,ser_]r
+a= f"\n� z=r_]rz eld.utn", "fr_]r("%Y-%m-%d %H:%M:%S UTC"nel_id))
+        h.s>d_len = 0
+          "unknr_cap']}**"
+        )
+        winner_rolls: int,
+    laimed       )
+        ommanner_rolls: int,
+    laiomma  tv)t_key ame', win
+0)
+            raw_keyr_rolls: iw.get("ke tv)t"\n", " ").strip()
+ safe_et.*",  short_key = ", "")).replace("`", "'").replace("/ d       )
+ nt_msg.jnner_rolls: iw.get("messagev)t"\mp_url)
+
+ []
+    txn_lines.}`**\n"
+       #{   /{vc{get(M= /{vc{.get(M= /{vc{       ommalf.user}:** <@{win){vcLAIer}_key = R>{link}"
+     +   prvc{nt_msg.j{vc_annt_msg.jn_url") )s:,}**"
+        )
+
+ nt_msmd   link = f" ([nt_msg.j{_url']}nt_msg.jn_url")  Key**"
+        e.}`**\n"
+       `#{   /` ne = f"{ico** <@{winner_i       ommal`)t_key}` — <t:{nt_msmd}t:,}`**\n"
+        ��Clai_id']afe_et.*",  shles80]}`ap']}**"
+        )
+     ]
+    used_chars + len(en2aw_ke7 4 > 1000:
+     n
+
+    embe  lines.append(entry)
+ 
+    ]
+    used_chars += len(entr=True)
+        else:
+      0
+    hidden_ch1it=500)
+
+ 0
+    hiddenkipped > 0:
+ n
+
+    embe  lines.}`**\n"
+       \n*…plusr Ho 0
+    hidde*{ad plac📭 No clai** d_keyodminldodb.get_claimist &our Key**     eyonomple to pcut_line!lls:,}**"
+        (titleest in   lin    {action.user.displa"user.id i_url")  Key*1
+
+    embed = discord.Embed(
+       abel �atching ClaimWinRecent {(titleest inlf. Keys: {len      )ed Keys",
+        description="\nn
+
+    emben(lines),
+        color=discord.Color.gold(),
+      pub_embed.set_footerOnPrivasi Ava**Sentnt(f"Fier sear  u Avall ke    dbe for db.get_claimist dds("vc", ">: `byice_st(iption="\n[]
+    txn(enipti).encod.reutf-8dds("vc")">: `l .t  embed = dF_seeio.ByiceIO(, ">: `byicen_ll .t       b.get_claimist ddsalse)
+
+    await interaction.followup.send(embed=l .t=")">: `l .td=embed, ephemeral=True)
 
 
-@bot.tree.command(name="setodds", description="[Admin] Update 1-in-N drop odds live")
+@bot.tree.command(
+   hangtfetiwinners",
+    description="[Rangtken, or       co&by All, Lile ce to c += ".id iwinn f"On_id"ockcap` revoko claimt file)",
+)
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    oneday_one_in="1 in N chance for 1-Day Key (default: 500)",
-    lifetime_one_in="1 in N chance for Lifetime Key (default: 3000)",
+   iscordly vsLile ce to / 24hr       coap` if you waangtwinnersdb.g` reaore_cap="Set Taangtile ce tos/       cChanneALL}` real usecausr (orDay Key",
 )
-async def setodds_cmd(
+asyhangtfetiwinners_cmd(
     interaction: discord.Interaction,
-    oneday_one_in: app_commands.Range[int, 1, 1000000],
-    lifetime_one_in: app_commands.Range[int, 1, 1000000],
+    user: Optional[discord.Member] = Nondb.g` reaore_cap: bool = False,
 ) -> None:
-    await interaction.response.defer(ephemeral=True)
-    db.set_setting("odds_1day", oneday_one_in)
-    db.set_setting("odds_lifetime", lifetime_one_in)
-    await interaction.followup.send(
-        f"✅ Drop odds updated!\n"
-        f"• **1-Day Key:** `1 in {oneday_one_in:,}`\n"
-        f"• **Lifetime Key:** `1 in {lifetime_one_in:,}`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="setstockcap", description="[Admin] Update max stock caps (default: 30 for 1-Day, 15 for Lifetime)")
-@app_commands.default_permissions(administrator=True)
-async def setstockcap_cmd(
-    interaction: discord.Interaction,
-    oneday_cap: app_commands.Range[int, 1, 10000],
-    lifetime_cap: app_commands.Range[int, 1, 10000],
-) -> None:
-    await interaction.response.defer(ephemeral=True)
-    db.set_setting("max_stock_1day", oneday_cap)
-    db.set_setting("max_stock_lifetime", lifetime_cap)
-    await interaction.followup.send(
-        f"✅ Max stock caps updated!\n"
-        f"• **1-Day Max Stock:** `{oneday_cap}`\n"
-        f"• **Lifetime Max Stock:** `{lifetime_cap}`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="setcooldown", description="[Admin] Configure roll cooldown (0 = off) and 1-Day repeat win cooldown")
-@app_commands.default_permissions(administrator=True)
-async def setcooldown_cmd(
-    interaction: discord.Interaction,
-    roll_cooldown_seconds: app_commands.Range[float, 0.0, 3600.0],
-    oneday_win_cooldown_hours: app_commands.Range[float, 0.0, 720.0] = 24.0,
-) -> None:
-    await interaction.response.defer(ephemeral=True)
-    db.set_setting("roll_cooldown_seconds", roll_cooldown_seconds)
-    db.set_setting("oneday_user_cooldown_hours", oneday_win_cooldown_hours)
-    await interaction.followup.send(
-        f"✅ Cooldowns updated!\n"
-        f"• **Message Roll Cooldown:** `{roll_cooldown_seconds:g}s`\n"
-        f"• **1-Day Repeat Win Cooldown:** `{oneday_win_cooldown_hours:g}h`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="clearstock", description="[Admin] Remove unclaimed keys from 1-Day or Lifetime stock")
-@app_commands.default_permissions(administrator=True)
-async def clearstock_cmd(
-    interaction: discord.Interaction,
-    tier: Literal["1day", "lifetime"],
-) -> None:
-    await interaction.response.defer(ephemeral=True)
-    removed = db.clear_available_keys(tier)
-    await interaction.followup.send(
-        f"🗑️ Cleared **{removed}** unclaimed key(s) from **{format_tier_name(tier)}**.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="powerhour", description="[Admin] Toggle Fortnite-style Power Hour boosted drop odds!")
-@app_commands.default_permissions(administrator=True)
-async def powerhour_cmd(
-    interaction: discord.Interaction,
-    multiplier: app_commands.Range[float, 1.0, 20.0],
-    duration_minutes: app_commands.Range[int, 1, 1440] = 60,
-    announce_here: bool = True,
-) -> None:
-    await interaction.response.defer(ephemeral=True)
-    if multiplier <= 1.0:
-        db.set_power_hour(1.0, 0)
-        await interaction.followup.send("⏹️ Power Hour turned **OFF** (back to normal odds).", ephemeral=True)
-        return
-
-    ends_at = db.set_power_hour(multiplier, duration_minutes)
-    await interaction.followup.send(
-        f"⚡ Power Hour started: **`{multiplier:g}x` odds** until <t:{int(ends_at)}:t>!",
-        ephemeral=True,
-    )
-    if announce_here and isinstance(interaction.channel, discord.TextChannel):
-        embed = discord.Embed(
-            title="⚡🏴‍☠️ PIRATE TOKEN POWER HOUR IS LIVE! 🏴‍☠️⚡",
-            description=(
-                f"Drop chances in chat & Voice Channels are boosted by **`{multiplier:g}x`** for the next **{duration_minutes} minutes**!\n"
-                f"⏳ Ends <t:{int(ends_at)}:R> — chat or hop in VC to hunt for keys!"
-            ),
-            color=discord.Color.gold(),
-        )
-        await interaction.channel.send(embed=embed)
-
-
-@bot.tree.command(name="ignorechannel", description="[Admin] Toggle ignoring a Text or Voice channel so it doesn't roll keys")
-@app_commands.default_permissions(administrator=True)
-async def ignorechannel_cmd(
-    interaction: discord.Interaction,
-    channel: Optional[Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel]] = None,
-) -> None:
-    await interaction.response.defer(ephemeral=True)
-    target = channel or interaction.channel
-    if target is None:
-        await interaction.followup.send("⚠️ Invalid channel.", ephemeral=True)
-        return
-    now_ignored = db.toggle_ignore_channel(target.id)
-    if now_ignored:
+    await interaction.response.defer(ephemeral=Truser.id if uis noner_id adb.g` reaoot won:
         await interaction.followup.send(
-            f"🔇 <#{target.id}> is now **ignored** — activity there will not roll for keys.",
+      += f"\nPd!**a `` re`et Taangtxt chagti`db.g` reaoremer` chance to  f"On_id.o roll!",
             ephemeral=True,
         )
-    else:
+        returserdb.g` reaoot won:
+ hidden_c_row s = db.gefeti(l_id", None)
         await interaction.followup.send(
-            f"🔊 <#{target.id}> is **enabled** again — activity there can roll for keys!",
+           Rangtile ce toso&b       cChanne Hohidde*{adlegedo cll_fos)! *(labeh exahs(ao   c}s`"*Use `/wilaimtier chang (odivat roll!",
+            ephemeral=True,
+              else:
+ _row s = db.gefeti(action.user.ie)
+        await interaction.followup.send(
+           Rangtiy All, Liiltero&ben, or       co    {actiowinner.m, maexapeople claimeagain.o roll!",
+            ephemeral=True,
+   =True)
+
+
+@bot.tree.command(etourcs",
+    description="[Cnd to co      # Voice Cl.id="Check Pirate Token dro&b valume keys")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describet("vc_="Et("vct chtio("vctVCh exaltiplo roll!g.get('n}" ie_et="ds: *N random ges VChr # 2) Roll • 1-D(ec}s50cs",ands.:_1dayo roll!t('one_lin}" ie_et="ds: *N random ges VChr # 2) Ro   • Lifeti(ec}s50cs",ands.:_ lim add to"t("vc_interval_ copieoftateo senVCh.id i in  els (** for rval_ (",ands.:_6im add toet("vc_min_  ionsmumc_min}ate in        rl usecausmmanout in VC  (",ands.:_2) add to",
+    ignore_dorekip ignore_d}` real(",ands.:_inline add to",
+    ignororekip mic-ignor}` real(",ands.:_inline add toet("vc_announce_   user="OChat in text  (like #gre_ ep* keyred VC anror in al uDay Key",
+)
+asy(etouwinners_cmd(
+    interaction: discord.Interactioet("vc_   user: Ope_ca.Member] = Nong.get('n}" ie_etvc_task: Optpies: app_commands.Rang50cs + 4444].Member] = Nont('one_lin}" ie_etvc_task: Optpies: app_commands.Rang50cs + 4444].Member] = Non"t("vc_interval_vc_task: Optpies: app_commands.Rang = m3644].Member] = Non_vc) < min_mc_task: Optpies: app_commands.Rang ng50].Member] = Non",
+    ignore_d   user: Ope_ca.Member] = Non",
+    ignor   user: Ope_ca.Member] = Nonet("vc_announce_   user: Optional[discord.Text.Member] =False,
+) -> None:
+    await interaction.response.defer(ephemeral=Truseret("vc_ent_msg is not None:
+ _rosol(db.get_setting("vc_enang("vc_al=Truserg.get('n}" ie_etent_msg is not None:
+ _rosol(db.get_setting("vc_odds_ollsMIN_BASE_ODDS,rg.get('n}" ie_et)al=Trusert('one_lin}" ie_etent_msg is not None:
+ _rosol(db.get_setting("vall", "lifeollsMIN_BASE_ODDS,rt('one_lin}" ie_et)al=Truser"t("vc_interval_ent_msg is not None:
+ _rosol(db.get_settiet("vc_interval_secet("vc_interval_al=Truser       min_mnt_msg is not None:
+ _rosol(db.get_settiet("vc_min_memet("vc_min_al=Truser",
+    ignore_dent_msg is not None:
+ _rosol(db.get_settieg("vc_ignore_deafeg("vc_ignore_dal=Truser",
+    ignor}nt_msg is not None:
+ _rosol(db.get_settieg("vc_ignore_meg("vc_ignoral=Truseret("vc_announce_}nt_msg is not None:
+ _rosol(db.get_setting("vc_announce_channeng("vc_announce_on.usounts(ur
+    vc_on = bool(db.get_setting("vc_enabled", True(ur
+1d vc_sec = int(db.get_setting("vc_odds_1day, True(ur
+    issec = int(db.get_setting("vc_odds_lifetime, True(ur
+ooter__sec = int(db.get_setting("vc_interval_seconds"True(ur
+    vc_min1, int(db.get_setting("vc_min_member"True(ur
+ignore_deaf = bool(db.get_setting("vc_ignore_deafened", False(ur
+ gnore_mute = bool(db.get_setting("vc_ignore_muted", False(ur
+    vcn_id = db.get_setting("vc_announce_channel_id", Nonappeock_lt_tf" �ur
+   el_id']}ur
+    _url")     # Voice 's   coilt-in te"=False)
+
+    await interaction.followumsg = (
+       **     # Voice C• VCSt_all_s:status}**\n"
+       Et("vc_  ldownur
+  }', 0)}s`**\n"
+        f"Bity_• VC Oll •dds: **(ur
+1dt_rolls|�☠️ **Lidds: **(ur
+n {eff_lt:,}`**\n"
+         # 2Ig("vc_iVC Olls (**1 roll e(ur
+ootds', 0)}s`**\n"
+       ion Hte in  user  ldownur
+n `{v, 0)}s`**\n"
+        f"• Dgnore_d  ldownur
+ignorolls|� f"• Mgnor  ldownur
+ngno{v, 0)}s`**\n"
+       oosteAg("vc_awinnmed appeockn(rows)}",
+        ephemeral=Tru  =True)
+
+
+@bot.tree.command(etng("rcs",
+    description="[Uproll Odds :-in-Ne Token drol= f"A    ds: *dayoe keys")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describg.get(' ie_et="ds: *N random 1-Damatch Roll • 1-D(ec}s50cs",ands.:_ lim add tot('one_li ie_et="ds: *N random 1-Damatch Ro   • Lifeti(ec}s50cs",ands.:_time"Day Key",
+)
+asy(etng("vinners_cmd(
+    interaction: discord.Interactiog.get(' ie_etvc_task: Optpies: app_commands.Rang50cs + 4444].Member] = Nont('one_li ie_etvc_task: Optpies: app_commands.Rang50cs + 4444].Member] =False,
+) -> None:
+    await interaction.response.defer(ephemeral=Truserg.get(' ie_et}nt_msg is not None:
+ _rosol(db.get_seng("vc_odds_ollsMIN_BASE_ODDS,rg.get(' ie_et)al=Trusert('one_li ie_et}nt_msg is not None:
+ _rosol(db.get_seng("vall", "lifeollsMIN_BASE_ODDS,rt('one_li ie_et)al True(ur
+1d vc_sec = int(db.get_setting("odds_1day, True(ur
+    issec = int(db.get_setting("odds_lifetime")False)
+
+    await interaction.followumsg = (
+       **amatcBity_oosted Dr:status}**\n"
+       ���️ **1-:st�dds: **(ur
+1dt_roatus}**\n"
+       ��   • Lifet:st�dds: **(ur
+n {eff(rows)}",
+        ephemeral=Tru  =True)
+
+
+@bot.tree.command(ete `/setsrcs",
+    description="[Uproll urrent max stal(",ands.:_ (e.g. 3️ or 1day, or 15x Lif+ keys")
+@app_commands.default_permissions(administrator=True)
+asynete `/setsvinners_cmd(
+    interaction: discord.Interactiog.get('ignortpies: app_commands.Rang ng + 44] = Nont('one_liignortpies: app_commands.Rang ng + 44] =False,
+) -> None:
+    await interaction.response.defer(ephemeral=Tru_rosol(db.get_se else "max_stoc,og.get('ignal=Tru_rosol(db.get_se else "max("odds_lifet('one_liign)False)
+
+    await interaction.followumsg = (
+       Mrrent max staluprolld!atus}**\n"
+       ���️ *Mrreilablest�d{g.get('ignroatus}**\n"
+       ��   • LiMrreilablest�d{t('one_liignff(rows)}",
+        ephemeral=Tru  =True)
+
+
+@bot.tree.command(et       crcs",
+    description="[Cnd to co s (**       co(0  ioff "1day�️ *repeatile c       cr+ keys")
+@app_commands.default_permissions(administrator=True)
+asynety_user_coinners_cmd(
+    interaction: discord.Interactiog.get('roll_cooldown_ortpies: app_commandsflotext0.0 m3644.4] = Nonstats['oneay_user_cooldowortpies: app_commandsflotext0.0 m724.4]  i24.0 =False,
+) -> None:
+    await interaction.response.defer(ephemeral=Tru_rosol(db.get_seg.get('roll_cooldown_rcsg.get('roll_cooldown_al=Tru_rosol(db.get_seg.get('oneday_user_cooldowc,og.get('oneay_user_cooldow)False)
+
+    await interaction.followumsg = (
+       C      cChuprolld!atus}**\n"
+       ��rd.abc.   # 2ay Win Cost�d{g.get('roll_cooldown_ogds'atus}**\n"
+       ���️ *Repeati 1-Day Win Cost�d{g.get('oneay_user_cooldowog}hf(rows)}",
+        ephemeral=Tru  =True)
+
+
+@bot.tree.commandclear(name="stock", description="[Removto pc�� No claimet,se unique 1-Day or Li(name=+ keys")
+@app_commands.default_permissions(administrator=True)
+asyclear(namearedkey_cmd(
+    interaction: discord.Interaction,
+    tier: Literal["1day", "lifetFalse,
+) -> None:
+    await interaction.response.defer(ephemeral=Truremovt claimed ear db.has_availaadd_ke)False)
+
+    await interaction.followumsg = (
+   🗑= f"� ear�� Loaremovt *{ad pc�� No clai** dt,se ) into **{format_tier_name(t.(rows)}",
+        ephemeral=Tru  =True)
+
+
+@bot.tree.commandpf"�oldo="stock", description="[Starttv)t_kste f"• Pow  += •0 Toke key     OFF, s key2day, 2xyoe keys")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describn] Add ,
+   E= •0 Toke key     OFF, y, 2day, 2x_mut}x` Bn dro(urre10xm add todudmi   miongno_ copielonge f"• Pow lastn  usiongno_ (",ands.:_6im add tong("vc_anhereld(ge taot send  f"• Pow ag("vc_awinn e can winounce_Day Key",
+)
+asypf"�oldoaredkey_cmd(
+    interaction: discord.Interaction] Add ,
+ ortpies: app_commandsflotext0.0 m14.4] = Nondudmi   miongno_ortpies: app_commands.Rang ng 444]  i60add tong("vc_anhereore_cap: emeralFalse,
+) -> None:
+    await interaction.response.defer(ephemeral=Trusern] Add ,
+ gnoreult > 1.0:
+ _rosol(pf"�ooldo(1.0 mr{cfg.getg.  eff_, eff_vc_lt, _, _ = db.get_effective_odds("chatchat) eff_v eff_vc_lt, _, _ = db.get_effective_odds("vce)
+        await interaction.followup.send(
+        ��e "� f"• Pow     ` BOFFop Odds__tr keynto *lBn dr:t:,}`**\n"
+           **amatost�ll •dds: **(
+1dt_ro | �️ **Lidds: **(
+n {efft:,}`**\n"
+           **VCost�ll •dds: **v
+1dt_ro | �️ **Lidds: **v
+n {eff(rows)}",
             ephemeral=True,
         )
+        retur mult, ends_asol(pf"�ooldo(n] Add ,
+ ,ndudmi   miongno_, True( eff_, eff_vc_lt, _, _ = db.get_effective_odds("chat) eff_v eff_vc_lt, _, _ = db.get_effective_odds("vc)
 
-
-@bot.tree.command(name="setlogchannel", description="[Admin] Set a staff channel to log every key drop")
-@app_commands.default_permissions(administrator=True)
-async def setlogchannel_cmd(
-    interaction: discord.Interaction,
-    channel: Optional[discord.TextChannel] = None,
-) -> None:
-    await interaction.response.defer(ephemeral=True)
-    if channel is None:
-        db.set_setting("log_channel_id", None)
-        await interaction.followup.send("📋 Drop log channel disabled.", ephemeral=True)
-    else:
-        db.set_setting("log_channel_id", channel.id)
-        await interaction.followup.send(
-            f"📋 Drop logs will now be sent to {channel.mention}.", ephemeral=True
+    await interaction.followumsg = (
+    ��� f"• Pow start` BActive dd ,
+ o`{mu){ad pg}x` until <t:{int(ends_!atus}**\n"
+       ��⚙️  f"• Chast�ll •dds: **(
+1dt_ro | �️ **Lidds: **(
+n {efft:,}`**\n"
+       ��⚙️  f"• Vst�ll •dds: **v
+1dt_ro | �️ **Lidds: **v
+n {eff(rows)}",
+        ephemeral=Tru  =Truseret("vc_anhere"1day    if isiname if intera.GuildChannel, discord.TextChannel):
+    log_embed = discord.Embed(
+     .Embed( ��title="🏴‍� "=== PIRATEe="⚡ POWEIS LOUR  FOUND! 🏴� ��(rows)}",
+     tock", descrdesc = (
+           oosterandomn  uspubli& out in Voice Chur Dmut}x` Bby alue=f"*dd ,
+ o`{must�     eyonlt-i) idudmi   miongno_}siongno_(tier)}**!\n"
+ d(
+        �� E* — ends <t:{int(ends_ Oddsctext="Chsteng out inhdden    unlock odds!"
+      rows)}",
+            color=discord.Color.gold(e,
         )
+ )
+
+    await interessage.channep.send(embed=embed)
 
 
-def run_bot() -> None:
-    token = (
-        os.getenv("DISCORD_TOKEN")
-        or os.getenv("BOT_TOKEN")
-        or os.getenv("TOKEN")
-        or ""
-    ).strip()
-    if not token or token == "YOUR_BOT_TOKEN_HERE":
-        print("=" * 65)
-        print("[ERROR] Missing Discord Bot Token!")
-        print("Set DISCORD_TOKEN (or BOT_TOKEN) in Bothost environment variables")
-        print("or your .env file before starting the bot.")
-        print("=" * 65)
-        sys.exit(1)
+@bot.tree.commandng("vcnounce_Dastock", description="[Togglemeg("vl Maa iscohanneut innounce_}soto vdoesou hs (**ners + keys")
+@app_commands.default_permissions(administrator=True)
+asyng("vcnounce_aredkey_cmd(
+    interaction: discord.Interactionounce_   user: Opannel: Union[discord.Text.Member, discorrd.Text.Member, dSguilrd.Text..Member] =False,
+) -> None:
+    await interaction.response.defer(ephemeral=Truest in   nounce_}RN] Ewait interessage. =Truserest in f uis not rows:
+        await interaction.followup+= f"\nInvalid nounce_ter yet.", ephemeral=True)
+        mmandow_)"
+    ignoretoggleing("vc_ld.get_cest inon.user.id)
+  w_)"
+    :s("vce)
+        await interaction.followup.send(
+       🔇 f" est inon.}>}nt_mswi) )"
+    op Odds    f"{a  eyrLile(**    if# 2) Rolaimit roll!",
+            ephemeral=True,
+              else:
+        await interaction.followup.send(
+       🔊 f" est inon.}>}nt_**ng("vc_op again Odds    f"{a  eyrLipeopif# 2) Rolaim!o roll!",
+            ephemeral=True,
+   =True)
 
+
+@bot.tree.command(etlognounce_Dastock", description="[e_caa staff nounce_}y poog*1 roll exaltipr+ keys")
+@app_commands.default_permissions(administrator=True)
+asynetlognounce_aredkey_cmd(
+    interaction: discord.Interactionounce_   user: Optional[discord.Text.Member] =False,
+) -> None:
+    await interaction.response.defer(ephemeral=Trusernounce_}nt_is not None:
+ _rosol(db.get_setting("log_channel_id", None)
+        await interaction.followup.se�_oosteoog*nounce_}tio("vcdter yet.", ephemeral=Tru       else:
+ _rosol(db.get_setting("log_channenounce_on.us else:
+        await interaction.followup.send(
+       �e�_oosteoogsile(**  w be     }y p{nounce_owinner.mter yet.", ephemerl=True,
+   =T
+asyhun_bPiraalse,
+) -> Nontirate e.}`**\n"
+ oer_stenv("FER SO _PIRATdds("vce)
+  Rooer_stenv("BOT_PIRATdds("vce)
+  Rooer_stenv("PIRATdds("vce)
+  Ro)  Key*n", " ").strip)
+
+    tirate    irate = "YPOW_BOT_PIRAT_HERE"ception:
+  :
+         65)eption:
+  :
+    rint(f"[Mlt_p MaDional[ B   Pirat!")eption:
+  :
+    e_caFER SO _PIRATiwinnBOT_PIRAT dro B  ht}xr mvironwinn vari("vcs")eption:
+  :
+    innk, an. mv=l .t bef• startp Ma clice)
+")eption:
+  :
+         65)eption:
+ simiexit(1       ("
     try:
-        bot.run(token)
-    except discord.PrivilegedIntentsRequired:
-        print("=" * 70)
-        print("[ERROR] 'Message Content Intent' is NOT enabled for your Discord Bot!")
-        print("Fix this in 10 seconds:")
-        print("  1. Open https://discord.com/developers/applications")
-        print("  2. Select your Application -> click 'Bot' on the left sidebar")
-        print("  3. Scroll down to 'Privileged Gateway Intents'")
-        print("  4. Turn ON 'MESSAGE CONTENT INTENT' and click Save Changes!")
-        print("=" * 70)
-        sys.exit(1)
+ ce)
+hun( iratal=True)
+    except dAdmi .tgedIsend(sR      rception:
+  :
+         70)eption:
+  :
+    rint(f"['rd.abc. C.send( Isend('}nt_iOTret("vc_efinnk, anDional[ B  !")eption:
+  :
+    Fixcan wi   d0or rval_:")eption:
+  :
+     reu[Adminhttps://except d)
+@/d1 rloefas/eyslicmi   s")eption:
+  :
+     r2.[e_lgetnk, anAyslicmi   alsen also'B  ' ousecauleft sidebar")eption:
+  :
+     r3.� 1-f# 2   coy p'Admi .tged Gatew•Isend(s'")eption:
+  :
+     r4. T    ON['rESSAGE CONTENT INTENT'"1dayn alsoSa��  f"nges!")eption:
+  :
+         70)eption:
+ simiexit(1   
+)
 
-
-if __name__ == "__main__":
-    run_bot()
+_at_ti__e = "__View__"ceptiohun_bPira
